@@ -28,8 +28,10 @@ use arrow::{
 use crate::physical_plan::{ColumnarValue, PhysicalExpr};
 use crate::{error::Result, scalar::ScalarValue};
 
+use serde::{Deserialize, Serialize};
+
 /// Represents a literal value
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Literal {
     value: ScalarValue,
 }
@@ -52,6 +54,7 @@ impl std::fmt::Display for Literal {
     }
 }
 
+#[typetag::serde(name = "literal")]
 impl PhysicalExpr for Literal {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {

@@ -26,15 +26,18 @@ use crate::{
     physical_plan::Partitioning,
     physical_plan::{common::SizedRecordBatchStream, DisplayFormatType, ExecutionPlan},
 };
+use crate::physical_plan::LambdaExecPlan;
 use arrow::{array::StringBuilder, datatypes::SchemaRef, record_batch::RecordBatch};
 
 use super::SendableRecordBatchStream;
 use async_trait::async_trait;
 
+use serde::{Deserialize, Serialize};
+
 /// Explain execution plan operator. This operator contains the string
 /// values of the various plans it has when it is created, and passes
 /// them to its output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExplainExec {
     /// The schema that this exec plan node outputs
     schema: SchemaRef,
@@ -58,9 +61,14 @@ impl ExplainExec {
 }
 
 #[async_trait]
+#[typetag::serde(name = "explain_exec")]
 impl ExecutionPlan for ExplainExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -132,5 +140,12 @@ impl ExecutionPlan for ExplainExec {
                 write!(f, "ExplainExec")
             }
         }
+    }
+}
+
+#[async_trait]
+impl LambdaExecPlan for ExplainExec {
+    fn feed_batches(&mut self, _partitions: Vec<Vec<RecordBatch>>) {
+        unimplemented!();
     }
 }

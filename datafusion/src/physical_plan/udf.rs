@@ -20,17 +20,20 @@
 use fmt::{Debug, Formatter};
 use std::fmt;
 
-use arrow::datatypes::Schema;
+// use arrow::datatypes::Schema;
 
-use crate::error::Result;
-use crate::{logical_plan::Expr, physical_plan::PhysicalExpr};
+// use crate::error::Result;
+use crate::logical_plan::Expr;
+// use crate::physical_plan::PhysicalExpr;
 
 use super::{
     functions::{
-        ReturnTypeFunction, ScalarFunctionExpr, ScalarFunctionImplementation, Signature,
+        ReturnTypeFunction, ScalarFunctionImplementation, Signature,
     },
-    type_coercion::coerce,
+    // type_coercion::coerce,
 };
+// use supper::functions::ScalarFunctionExpr;
+
 use std::sync::Arc;
 
 /// Logical representation of a UDF.
@@ -95,25 +98,25 @@ impl ScalarUDF {
     }
 }
 
-/// Create a physical expression of the UDF.
-/// This function errors when `args`' can't be coerced to a valid argument type of the UDF.
-pub fn create_physical_expr(
-    fun: &ScalarUDF,
-    args: &[Arc<dyn PhysicalExpr>],
-    input_schema: &Schema,
-) -> Result<Arc<dyn PhysicalExpr>> {
-    // coerce
-    let args = coerce(args, input_schema, &fun.signature)?;
+// Create a physical expression of the UDF.
+// This function errors when `args`' can't be coerced to a valid argument type of the UDF.
+// pub fn create_physical_expr(
+//     fun: &ScalarUDF,
+//     args: &[Arc<dyn PhysicalExpr>],
+//     input_schema: &Schema,
+// ) -> Result<Arc<dyn PhysicalExpr>> {
+//     // coerce
+//     let args = coerce(args, input_schema, &fun.signature)?;
 
-    let arg_types = args
-        .iter()
-        .map(|e| e.data_type(input_schema))
-        .collect::<Result<Vec<_>>>()?;
+//     let arg_types = args
+//         .iter()
+//         .map(|e| e.data_type(input_schema))
+//         .collect::<Result<Vec<_>>>()?;
 
-    Ok(Arc::new(ScalarFunctionExpr::new(
-        &fun.name,
-        fun.fun.clone(),
-        args,
-        (fun.return_type)(&arg_types)?.as_ref(),
-    )))
-}
+//     Ok(Arc::new(ScalarFunctionExpr::new(
+//         &fun.name,
+//         fun.fun.clone(),
+//         args,
+//         (fun.return_type)(&arg_types)?.as_ref(),
+//     )))
+// }

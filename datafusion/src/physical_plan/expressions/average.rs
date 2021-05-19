@@ -30,11 +30,12 @@ use arrow::{
     array::{ArrayRef, UInt64Array},
     datatypes::Field,
 };
+use serde::{Deserialize, Serialize};
 
 use super::{format_state_name, sum};
 
 /// AVG aggregate expression
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Avg {
     name: String,
     data_type: DataType,
@@ -74,6 +75,7 @@ impl Avg {
     }
 }
 
+#[typetag::serde(name = "avg")]
 impl AggregateExpr for Avg {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {

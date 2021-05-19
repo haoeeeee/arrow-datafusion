@@ -19,6 +19,7 @@
 
 use crate::error::{DataFusionError, Result};
 use crate::physical_plan::{common, DisplayFormatType, ExecutionPlan, Partitioning};
+use crate::physical_plan::LambdaExecPlan;
 use arrow::csv;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::Result as ArrowResult;
@@ -34,6 +35,8 @@ use std::task::{Context, Poll};
 
 use super::{RecordBatchStream, SendableRecordBatchStream};
 use async_trait::async_trait;
+
+use serde::{Deserialize, Serialize};
 
 /// CSV file read option
 #[derive(Copy, Clone)]
@@ -107,6 +110,7 @@ impl<'a> CsvReadOptions<'a> {
 }
 
 ///  Source represents where the data comes from.
+#[derive(Serialize, Deserialize)]
 enum Source {
     /// The data comes from partitioned files
     PartitionedFiles {
@@ -117,6 +121,7 @@ enum Source {
     },
 
     /// The data comes from anything impl Read trait
+    #[serde(skip)]
     Reader(Mutex<Option<Box<dyn Read + Send + Sync + 'static>>>),
 }
 
@@ -178,7 +183,7 @@ impl Source {
 }
 
 /// Execution plan for scanning a CSV file
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CsvExec {
     /// Where the data comes from.
     source: Source,
@@ -341,9 +346,14 @@ impl CsvExec {
 }
 
 #[async_trait]
+#[typetag::serde(name = "csv_exec")]
 impl ExecutionPlan for CsvExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -432,6 +442,13 @@ impl ExecutionPlan for CsvExec {
                 )
             }
         }
+    }
+}
+
+#[async_trait]
+impl LambdaExecPlan for CsvExec {
+    fn feed_batches(&mut self, _partitions: Vec<Vec<RecordBatch>>) {
+        unimplemented!();
     }
 }
 

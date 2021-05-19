@@ -24,6 +24,7 @@ use crate::error::{DataFusionError, Result};
 use crate::physical_plan::{
     memory::MemoryStream, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
 };
+use crate::physical_plan::LambdaExecPlan;
 use arrow::array::NullArray;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -32,8 +33,10 @@ use super::SendableRecordBatchStream;
 
 use async_trait::async_trait;
 
+use serde::{Deserialize, Serialize};
+
 /// Execution plan for empty relation (produces no rows)
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EmptyExec {
     /// Specifies whether this exec produces a row or not
     produce_one_row: bool,
@@ -57,9 +60,14 @@ impl EmptyExec {
 }
 
 #[async_trait]
+#[typetag::serde(name = "empty_exec")]
 impl ExecutionPlan for EmptyExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -132,6 +140,13 @@ impl ExecutionPlan for EmptyExec {
                 write!(f, "EmptyExec: produce_one_row={}", self.produce_one_row)
             }
         }
+    }
+}
+
+#[async_trait]
+impl LambdaExecPlan for EmptyExec {
+    fn feed_batches(&mut self, _partitions: Vec<Vec<RecordBatch>>) {
+        unimplemented!();
     }
 }
 

@@ -36,8 +36,10 @@ use arrow::{
 
 use super::format_state_name;
 
+use serde::{Deserialize, Serialize};
+
 /// SUM aggregate expression
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Sum {
     name: String,
     data_type: DataType,
@@ -75,6 +77,7 @@ impl Sum {
     }
 }
 
+#[typetag::serde(name = "sum")]
 impl AggregateExpr for Sum {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {

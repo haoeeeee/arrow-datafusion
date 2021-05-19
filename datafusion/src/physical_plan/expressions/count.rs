@@ -30,11 +30,13 @@ use arrow::{
     datatypes::Field,
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::format_state_name;
 
 /// COUNT aggregate expression
 /// Returns the amount of non-null values of the given expression.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Count {
     name: String,
     data_type: DataType,
@@ -54,6 +56,7 @@ impl Count {
     }
 }
 
+#[typetag::serde(name = "count")]
 impl AggregateExpr for Count {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {

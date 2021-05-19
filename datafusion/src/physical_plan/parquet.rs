@@ -28,6 +28,7 @@ use super::{
     SendableRecordBatchStream,
 };
 use crate::physical_plan::{common, DisplayFormatType, ExecutionPlan, Partitioning};
+use crate::physical_plan::LambdaExecPlan;
 use crate::{
     error::{DataFusionError, Result},
     execution::context::ExecutionContextState,
@@ -61,9 +62,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::datasource::datasource::{ColumnStatistics, Statistics};
 use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
+use serde::{Deserialize, Serialize};
 
 /// Execution plan for scanning one or more Parquet partitions
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParquetExec {
     /// Parquet partitions to read
     partitions: Vec<ParquetPartition>,
@@ -90,7 +92,7 @@ pub struct ParquetExec {
 /// We may also want to support reading Parquet files that are partitioned based on a key and
 /// in this case we would want this partition struct to represent multiple files for a given
 /// partition key (see [ARROW-11019](https://issues.apache.org/jira/browse/ARROW-11019)).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParquetPartition {
     /// The Parquet filename for this partition
     pub filenames: Vec<String>,
@@ -358,7 +360,7 @@ impl ParquetPartition {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 /// Predicate builder used for generating of predicate functions, used to filter row group metadata
 pub struct RowGroupPredicateBuilder {
     parquet_schema: Schema,
@@ -706,7 +708,7 @@ fn build_predicate_expression(
     Ok(statistics_expr)
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq)]
 enum StatisticsType {
     Min,
     Max,
@@ -798,9 +800,14 @@ fn build_statistics_array(
 }
 
 #[async_trait]
+#[typetag::serde(name = "parquet_exec")]
 impl ExecutionPlan for ParquetExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -889,6 +896,13 @@ impl ExecutionPlan for ParquetExec {
                 )
             }
         }
+    }
+}
+
+#[async_trait]
+impl LambdaExecPlan for ParquetExec {
+    fn feed_batches(&mut self, _partitions: Vec<Vec<RecordBatch>>) {
+        unimplemented!();
     }
 }
 

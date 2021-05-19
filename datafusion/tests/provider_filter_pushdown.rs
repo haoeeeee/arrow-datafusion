@@ -26,10 +26,12 @@ use datafusion::error::Result;
 use datafusion::execution::context::ExecutionContext;
 use datafusion::logical_plan::Expr;
 use datafusion::physical_plan::common::SizedRecordBatchStream;
-use datafusion::physical_plan::{ExecutionPlan, Partitioning, SendableRecordBatchStream};
+use datafusion::physical_plan::{ExecutionPlan, LambdaExecPlan, Partitioning, SendableRecordBatchStream};
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
 
 fn create_batch(value: i32, num_rows: usize) -> Result<RecordBatch> {
     let mut builder = Int32Builder::new(num_rows);
@@ -47,15 +49,28 @@ fn create_batch(value: i32, num_rows: usize) -> Result<RecordBatch> {
     )?)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CustomPlan {
     schema: SchemaRef,
+    #[serde(skip)]
     batches: Vec<Arc<RecordBatch>>,
 }
 
 #[async_trait]
+impl LambdaExecPlan for CustomPlan {
+    fn feed_batches(&mut self, _partitions: Vec<Vec<RecordBatch>>) {
+        unimplemented!();
+    }
+}
+
+#[async_trait]
+#[typetag::serde(name = "custom_plan")]
 impl ExecutionPlan for CustomPlan {
     fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn std::any::Any {
         self
     }
 
@@ -94,6 +109,10 @@ struct CustomProvider {
 
 impl TableProvider for CustomProvider {
     fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn std::any::Any {
         self
     }
 

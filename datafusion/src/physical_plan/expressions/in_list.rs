@@ -35,8 +35,10 @@ use crate::error::Result;
 use crate::physical_plan::{ColumnarValue, PhysicalExpr};
 use crate::scalar::ScalarValue;
 
+use serde::{Deserialize, Serialize};
+
 /// InList
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct InListExpr {
     expr: Arc<dyn PhysicalExpr>,
     list: Vec<Arc<dyn PhysicalExpr>>,
@@ -204,6 +206,7 @@ impl std::fmt::Display for InListExpr {
     }
 }
 
+#[typetag::serde(name = "in_list_expr")]
 impl PhysicalExpr for InListExpr {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {

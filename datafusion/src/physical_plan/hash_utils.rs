@@ -20,9 +20,10 @@
 use crate::error::{DataFusionError, Result};
 use arrow::datatypes::{Field, Schema};
 use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
 
 /// All valid types of joins.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum JoinType {
     /// Inner Join
     Inner,

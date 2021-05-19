@@ -39,6 +39,9 @@ use super::{
     coalesce_batches::concat_batches, memory::MemoryStream, DisplayFormatType,
     ExecutionPlan, Partitioning, RecordBatchStream, SendableRecordBatchStream,
 };
+use super::LambdaExecPlan;
+
+use serde::{Deserialize, Serialize};
 use log::debug;
 
 /// Data of the left side
@@ -46,7 +49,7 @@ type JoinLeftData = RecordBatch;
 
 /// executes partitions in parallel and combines them into a set of
 /// partitions by combining all values from the left with all values on the right
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CrossJoinExec {
     /// left (build) side which gets loaded in memory
     left: Arc<dyn ExecutionPlan>,
@@ -55,6 +58,7 @@ pub struct CrossJoinExec {
     /// The schema once the join is applied
     schema: SchemaRef,
     /// Build-side data
+    #[serde(skip)]
     build_side: Arc<Mutex<Option<JoinLeftData>>>,
 }
 
@@ -101,8 +105,13 @@ impl CrossJoinExec {
 }
 
 #[async_trait]
+#[typetag::serde(name = "cross_join_exec")]
 impl ExecutionPlan for CrossJoinExec {
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -204,6 +213,13 @@ impl ExecutionPlan for CrossJoinExec {
                 write!(f, "CrossJoinExec")
             }
         }
+    }
+}
+
+#[async_trait]
+impl LambdaExecPlan for CrossJoinExec {
+    fn feed_batches(&mut self, _partitions: Vec<Vec<RecordBatch>>) {
+        unimplemented!();
     }
 }
 

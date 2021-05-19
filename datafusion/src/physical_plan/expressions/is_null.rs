@@ -28,8 +28,10 @@ use arrow::{
 use crate::physical_plan::{ColumnarValue, PhysicalExpr};
 use crate::{error::Result, scalar::ScalarValue};
 
+use serde::{Deserialize, Serialize};
+
 /// IS NULL expression
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct IsNullExpr {
     /// Input expression
     arg: Arc<dyn PhysicalExpr>,
@@ -53,6 +55,7 @@ impl std::fmt::Display for IsNullExpr {
     }
 }
 
+#[typetag::serde(name = "in_null_expr")]
 impl PhysicalExpr for IsNullExpr {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {

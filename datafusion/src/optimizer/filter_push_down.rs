@@ -988,6 +988,10 @@ mod tests {
             self
         }
 
+        fn as_mut_any(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
         fn statistics(&self) -> Statistics {
             Statistics::default()
         }

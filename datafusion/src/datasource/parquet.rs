@@ -64,6 +64,10 @@ impl TableProvider for ParquetTable {
         self
     }
 
+    fn as_mut_any(&mut self) -> &mut dyn Any {
+        self
+    }
+
     /// Get the schema for this parquet file.
     fn schema(&self) -> SchemaRef {
         self.schema.clone()

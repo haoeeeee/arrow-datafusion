@@ -29,8 +29,10 @@ use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use compute::can_cast_types;
 
+use serde::{Deserialize, Serialize};
+
 /// TRY_CAST expression casts an expression to a specific data type and retuns NULL on invalid cast
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TryCastExpr {
     /// The expression to cast
     expr: Arc<dyn PhysicalExpr>,
@@ -61,6 +63,7 @@ impl fmt::Display for TryCastExpr {
     }
 }
 
+#[typetag::serde(name = "try_cast_expr")]
 impl PhysicalExpr for TryCastExpr {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {

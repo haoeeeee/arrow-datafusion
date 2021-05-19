@@ -24,6 +24,7 @@ use crate::error::{DataFusionError, Result};
 use crate::physical_plan::PhysicalExpr;
 use arrow::compute::kernels::sort::{SortColumn, SortOptions};
 use arrow::record_batch::RecordBatch;
+use serde::{Deserialize, Serialize};
 
 mod average;
 #[macro_use]
@@ -66,7 +67,7 @@ pub fn format_state_name(name: &str, state_name: &str) -> String {
 }
 
 /// Represents Sort operation for a column in a RecordBatch
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PhysicalSortExpr {
     /// Physical expression representing the column to sort
     pub expr: Arc<dyn PhysicalExpr>,

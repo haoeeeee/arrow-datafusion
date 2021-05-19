@@ -37,13 +37,16 @@ use arrow::{
 use super::RecordBatchStream;
 use crate::error::{DataFusionError, Result};
 use crate::physical_plan::{DisplayFormatType, ExecutionPlan, Partitioning};
+use crate::physical_plan::LambdaExecPlan;
 
 use super::SendableRecordBatchStream;
 use pin_project_lite::pin_project;
 
+use serde::{Deserialize, Serialize};
+
 /// Merge execution plan executes partitions in parallel and combines them into a single
 /// partition. No guarantees are made about the order of the resulting partition.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MergeExec {
     /// Input execution plan
     input: Arc<dyn ExecutionPlan>,
@@ -62,9 +65,14 @@ impl MergeExec {
 }
 
 #[async_trait]
+#[typetag::serde(name = "merge_exec")]
 impl ExecutionPlan for MergeExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -161,6 +169,13 @@ impl ExecutionPlan for MergeExec {
                 write!(f, "MergeExec")
             }
         }
+    }
+}
+
+#[async_trait]
+impl LambdaExecPlan for MergeExec {
+    fn feed_batches(&mut self, _partitions: Vec<Vec<RecordBatch>>) {
+        unimplemented!();
     }
 }
 

@@ -31,6 +31,8 @@ use arrow::{
 use crate::error::{DataFusionError, Result};
 use crate::physical_plan::{ColumnarValue, PhysicalExpr};
 
+use serde::{Deserialize, Serialize};
+
 use super::coercion;
 
 /// Invoke a compute kernel on array(s)
@@ -46,7 +48,7 @@ macro_rules! compute_op {
 }
 
 /// Negative expression
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct NegativeExpr {
     /// Input expression
     arg: Arc<dyn PhysicalExpr>,
@@ -70,6 +72,7 @@ impl std::fmt::Display for NegativeExpr {
     }
 }
 
+#[typetag::serde(name = "negative_expr")]
 impl PhysicalExpr for NegativeExpr {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {

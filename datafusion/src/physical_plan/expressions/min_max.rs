@@ -38,8 +38,10 @@ use arrow::{
 
 use super::format_state_name;
 
+use serde::{Deserialize, Serialize};
+
 /// MAX aggregate expression
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Max {
     name: String,
     data_type: DataType,
@@ -59,6 +61,7 @@ impl Max {
     }
 }
 
+#[typetag::serde(name = "max")]
 impl AggregateExpr for Max {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
@@ -342,7 +345,7 @@ impl Accumulator for MaxAccumulator {
 }
 
 /// MIN aggregate expression
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Min {
     name: String,
     data_type: DataType,
@@ -362,6 +365,7 @@ impl Min {
     }
 }
 
+#[typetag::serde(name = "min")]
 impl AggregateExpr for Min {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {

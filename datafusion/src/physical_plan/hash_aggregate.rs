@@ -28,9 +28,10 @@ use futures::{
 };
 
 use crate::error::{DataFusionError, Result};
+use crate::physical_plan::memory::MemoryExec;
 use crate::physical_plan::{
     Accumulator, AggregateExpr, DisplayFormatType, Distribution, ExecutionPlan,
-    Partitioning, PhysicalExpr, SQLMetric,
+    LambdaExecPlan, Partitioning, PhysicalExpr, SQLMetric,
 };
 
 use arrow::{
@@ -66,13 +67,14 @@ use arrow::array::{
 };
 use async_trait::async_trait;
 
+use serde::{Deserialize, Serialize};
 use super::{
     expressions::Column, group_scalar::GroupByScalar, RecordBatchStream,
     SendableRecordBatchStream,
 };
 
 /// Hash aggregate modes
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub enum AggregateMode {
     /// Partial aggregate that can be applied in parallel across input partitions
     Partial,
@@ -88,7 +90,7 @@ pub enum AggregateMode {
 }
 
 /// Hash aggregate execution plan
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HashAggregateExec {
     /// Aggregation mode (full, partial)
     mode: AggregateMode,
@@ -167,6 +169,24 @@ impl HashAggregateExec {
         })
     }
 
+    /// Get new orphan of execution plan
+    pub fn new_orphan(&self) -> Arc<HashAggregateExec> {
+        let mut projection = None;
+        if let Some(memory_exec) = self.input().as_any().downcast_ref::<MemoryExec>() {
+            projection = memory_exec.projection().clone();
+        }
+        let memory_exec = MemoryExec::try_new(&vec![], self.schema(), projection).unwrap();
+        Arc::new(HashAggregateExec {
+            input: Arc::new(memory_exec),
+            mode: self.mode.clone(),
+            group_expr: self.group_expr.clone(),
+            aggr_expr: self.aggr_expr.clone(),
+            schema: self.schema().clone(),
+            input_schema: self.input_schema().clone(),
+            output_rows: self.output_rows.clone(),
+        })
+    }
+
     /// Aggregation mode (full, partial)
     pub fn mode(&self) -> &AggregateMode {
         &self.mode
@@ -194,9 +214,25 @@ impl HashAggregateExec {
 }
 
 #[async_trait]
+impl LambdaExecPlan for HashAggregateExec {
+    fn feed_batches(&mut self, partitions: Vec<Vec<RecordBatch>>) {
+        self.input = Arc::new(MemoryExec {
+            partitions,
+            schema: self.schema(),
+            projection: None,
+        });
+    }
+}
+
+#[async_trait]
+#[typetag::serde(name = "hash_aggregate_exec")]
 impl ExecutionPlan for HashAggregateExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -1350,17 +1386,30 @@ mod tests {
 
     /// Define a test source that can yield back to runtime before returning its first item ///
 
-    #[derive(Debug)]
+    #[derive(Debug, Serialize, Deserialize)]
     struct TestYieldingExec {
         /// True if this exec should yield back to runtime the first time it is polled
         pub yield_first: bool,
     }
 
     #[async_trait]
+    impl LambdaExecPlan for TestYieldingExec {
+        fn feed_batches(&mut self, _: Vec<Vec<RecordBatch>>) {
+            unimplemented!();
+        }
+    }
+
+    #[async_trait]
+    #[typetag::serde(name = "test_yield_exec")]
     impl ExecutionPlan for TestYieldingExec {
         fn as_any(&self) -> &dyn Any {
             self
         }
+
+        fn as_mut_any(&mut self) -> &mut dyn Any {
+            self
+        }
+
         fn schema(&self) -> SchemaRef {
             some_data().0
         }

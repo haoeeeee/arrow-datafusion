@@ -28,6 +28,8 @@ use arrow::datatypes::{DataType, Field};
 use ahash::RandomState;
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{DataFusionError, Result};
 use crate::physical_plan::group_scalar::GroupByScalar;
 use crate::physical_plan::{Accumulator, AggregateExpr, PhysicalExpr};
@@ -41,7 +43,7 @@ fn format_state_name(name: &str, state_name: &str) -> String {
 }
 
 /// Expression for a COUNT(DISTINCT) aggregation.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DistinctCount {
     /// Column name
     name: String,
@@ -81,6 +83,7 @@ fn state_type(data_type: DataType) -> DataType {
     }
 }
 
+#[typetag::serde(name = "distinct_count")]
 impl AggregateExpr for DistinctCount {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {

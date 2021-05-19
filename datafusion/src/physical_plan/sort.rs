@@ -43,9 +43,12 @@ use crate::physical_plan::expressions::PhysicalSortExpr;
 use crate::physical_plan::{
     common, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, SQLMetric,
 };
+use crate::physical_plan::LambdaExecPlan;
+
+use serde::{Deserialize, Serialize};
 
 /// Sort execution plan
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SortExec {
     /// Input schema
     input: Arc<dyn ExecutionPlan>,
@@ -83,9 +86,14 @@ impl SortExec {
 }
 
 #[async_trait]
+#[typetag::serde(name = "sort_exec")]
 impl ExecutionPlan for SortExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -163,6 +171,13 @@ impl ExecutionPlan for SortExec {
         metrics.insert("outputRows".to_owned(), (*self.output_rows).clone());
         metrics.insert("sortTime".to_owned(), (*self.sort_time_nanos).clone());
         metrics
+    }
+}
+
+#[async_trait]
+impl LambdaExecPlan for SortExec {
+    fn feed_batches(&mut self, _partitions: Vec<Vec<RecordBatch>>) {
+        unimplemented!();
     }
 }
 

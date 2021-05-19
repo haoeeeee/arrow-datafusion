@@ -26,9 +26,10 @@ use arrow::{
 
 use crate::error::Result;
 use crate::physical_plan::{ColumnarValue, PhysicalExpr};
+use serde::{Deserialize, Serialize};
 
 /// Represents the column at a given index in a RecordBatch
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Column {
     name: String,
 }
@@ -53,6 +54,7 @@ impl std::fmt::Display for Column {
     }
 }
 
+#[typetag::serde(name = "column")]
 impl PhysicalExpr for Column {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn std::any::Any {

@@ -25,8 +25,9 @@ use std::task::{Context, Poll};
 
 use super::{RecordBatchStream, SendableRecordBatchStream};
 use crate::error::{DataFusionError, Result};
+use crate::physical_plan::memory::MemoryExec;
 use crate::physical_plan::{
-    DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr,
+    DisplayFormatType, ExecutionPlan, LambdaExecPlan, Partitioning, PhysicalExpr,
 };
 use arrow::array::BooleanArray;
 use arrow::compute::filter_record_batch;
@@ -38,9 +39,11 @@ use async_trait::async_trait;
 
 use futures::stream::{Stream, StreamExt};
 
+use serde::{Deserialize, Serialize};
+
 /// FilterExec evaluates a boolean predicate against all input batches to determine which rows to
 /// include in its output batches.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FilterExec {
     /// The expression to filter on. This expression must evaluate to a boolean value.
     predicate: Arc<dyn PhysicalExpr>,
@@ -66,6 +69,19 @@ impl FilterExec {
         }
     }
 
+    /// Get new orphan of execution plan
+    pub fn new_orphan(&self) -> Arc<FilterExec> {
+        let mut projection = None;
+        if let Some(memory_exec) = self.input().as_any().downcast_ref::<MemoryExec>() {
+            projection = memory_exec.projection().clone();
+        }
+        let memory_exec = MemoryExec::try_new(&vec![], self.schema(), projection).unwrap();
+        Arc::new(FilterExec {
+            input: Arc::new(memory_exec),
+            predicate: self.predicate.clone(),
+        })
+    }
+
     /// The expression to filter on. This expression must evaluate to a boolean value.
     pub fn predicate(&self) -> &Arc<dyn PhysicalExpr> {
         &self.predicate
@@ -78,9 +94,25 @@ impl FilterExec {
 }
 
 #[async_trait]
+impl LambdaExecPlan for FilterExec {
+    fn feed_batches(&mut self, partitions: Vec<Vec<RecordBatch>>) {
+        self.input = Arc::new(MemoryExec {
+            partitions,
+            schema: self.schema(),
+            projection: None,
+        });
+    }
+}
+
+#[async_trait]
+#[typetag::serde(name = "filter_exec")]
 impl ExecutionPlan for FilterExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 

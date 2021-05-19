@@ -36,6 +36,8 @@ use super::{
 };
 use crate::logical_plan::dfschema::DFSchemaRef;
 
+use serde::{Deserialize, Serialize};
+
 /// Join type
 #[derive(Debug, Clone, Copy)]
 pub enum JoinType {
@@ -735,7 +737,7 @@ impl fmt::Debug for LogicalPlan {
 }
 
 /// Represents which type of plan
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PlanType {
     /// The initial LogicalPlan provided to DataFusion
     LogicalPlan,
@@ -761,7 +763,7 @@ impl From<&PlanType> for String {
 }
 
 /// Represents some sort of execution plan, in String form
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::rc_buffer)]
 pub struct StringifiedPlan {
     /// An identifier of what type of plan this string represents

@@ -64,6 +64,9 @@ use super::{
     SendableRecordBatchStream,
 };
 use crate::physical_plan::coalesce_batches::concat_batches;
+use crate::physical_plan::LambdaExecPlan;
+
+use serde::{Deserialize, Serialize};
 use log::debug;
 
 // Maps a `u64` hash value based on the left ["on" values] to a list of indices with this key's value.
@@ -83,7 +86,7 @@ type JoinLeftData = Arc<(JoinHashMap, RecordBatch)>;
 
 /// join execution plan executes partitions in parallel and combines them into a set of
 /// partitions.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HashJoinExec {
     /// left (build) side which gets hashed
     left: Arc<dyn ExecutionPlan>,
@@ -96,6 +99,7 @@ pub struct HashJoinExec {
     /// The schema once the join is applied
     schema: SchemaRef,
     /// Build-side
+    #[serde(skip)]
     build_side: Arc<Mutex<Option<JoinLeftData>>>,
     /// Shares the `RandomState` for the hashing algorithm
     random_state: RandomState,
@@ -103,7 +107,7 @@ pub struct HashJoinExec {
     mode: PartitionMode,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 /// Partitioning mode to use for hash join
 pub enum PartitionMode {
     /// Left/right children are partitioned using the left and right keys
@@ -213,8 +217,13 @@ impl HashJoinExec {
 }
 
 #[async_trait]
+#[typetag::serde(name = "hash_join_exec")]
 impl ExecutionPlan for HashJoinExec {
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -412,6 +421,13 @@ impl ExecutionPlan for HashJoinExec {
                 )
             }
         }
+    }
+}
+
+#[async_trait]
+impl LambdaExecPlan for HashJoinExec {
+    fn feed_batches(&mut self, _partitions: Vec<Vec<RecordBatch>>) {
+        unimplemented!();
     }
 }
 

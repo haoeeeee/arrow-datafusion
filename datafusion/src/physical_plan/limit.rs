@@ -29,6 +29,7 @@ use crate::error::{DataFusionError, Result};
 use crate::physical_plan::{
     DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
 };
+use crate::physical_plan::LambdaExecPlan;
 use arrow::array::ArrayRef;
 use arrow::compute::limit;
 use arrow::datatypes::SchemaRef;
@@ -39,8 +40,10 @@ use super::{RecordBatchStream, SendableRecordBatchStream};
 
 use async_trait::async_trait;
 
+use serde::{Deserialize, Serialize};
+
 /// Limit execution plan
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GlobalLimitExec {
     /// Input execution plan
     input: Arc<dyn ExecutionPlan>,
@@ -66,9 +69,14 @@ impl GlobalLimitExec {
 }
 
 #[async_trait]
+#[typetag::serde(name = "global_limit_exec")]
 impl ExecutionPlan for GlobalLimitExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -137,8 +145,15 @@ impl ExecutionPlan for GlobalLimitExec {
     }
 }
 
+#[async_trait]
+impl LambdaExecPlan for GlobalLimitExec {
+    fn feed_batches(&mut self, _partitions: Vec<Vec<RecordBatch>>) {
+        unimplemented!();
+    }
+}
+
 /// LocalLimitExec applies a limit to a single partition
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LocalLimitExec {
     /// Input execution plan
     input: Arc<dyn ExecutionPlan>,
@@ -164,9 +179,14 @@ impl LocalLimitExec {
 }
 
 #[async_trait]
+#[typetag::serde(name = "local_limit_exec")]
 impl ExecutionPlan for LocalLimitExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -212,6 +232,13 @@ impl ExecutionPlan for LocalLimitExec {
                 write!(f, "LocalLimitExec: limit={}", self.limit)
             }
         }
+    }
+}
+
+#[async_trait]
+impl LambdaExecPlan for LocalLimitExec {
+    fn feed_batches(&mut self, _partitions: Vec<Vec<RecordBatch>>) {
+        unimplemented!();
     }
 }
 

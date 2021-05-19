@@ -37,6 +37,8 @@ use futures::stream::Stream;
 use self::{display::DisplayableExecutionPlan, merge::MergeExec};
 use hashbrown::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 /// Trait for types that stream [arrow::record_batch::RecordBatch]
 pub trait RecordBatchStream: Stream<Item = ArrowResult<RecordBatch>> {
     /// Returns the schema of this `RecordBatchStream`.
@@ -50,7 +52,7 @@ pub trait RecordBatchStream: Stream<Item = ArrowResult<RecordBatch>> {
 pub type SendableRecordBatchStream = Pin<Box<dyn RecordBatchStream + Send + Sync>>;
 
 /// SQL metric type
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MetricType {
     /// Simple counter
     Counter,
@@ -60,7 +62,7 @@ pub enum MetricType {
 
 /// SQL metric such as counter (number of input or output rows) or timing information about
 /// a physical operator.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SQLMetric {
     /// Metric value
     value: AtomicUsize,
@@ -132,10 +134,13 @@ pub trait PhysicalPlanner {
 /// return value from [`displayable`] in addition to the (normally
 /// quite verbose) `Debug` output.
 #[async_trait]
-pub trait ExecutionPlan: Debug + Send + Sync {
+#[typetag::serde(tag = "execution_plan")]
+pub trait ExecutionPlan: Debug + Send + Sync + LambdaExecPlan {
     /// Returns the execution plan as [`Any`](std::any::Any) so that it can be
     /// downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
+    /// Return the value as an mutable Any to allow for downcasts without transmutation
+    fn as_mut_any(&mut self) -> &mut dyn Any;
     /// Get the schema for this execution plan
     fn schema(&self) -> SchemaRef;
     /// Specifies the output partitioning scheme of this plan
@@ -172,6 +177,12 @@ pub trait ExecutionPlan: Debug + Send + Sync {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "ExecutionPlan(PlaceHolder)")
     }
+}
+
+/// Partition-aware execution plan for a relation on AWS Lambda
+pub trait LambdaExecPlan: Debug + Send + Sync { 
+    /// Feed record batches from other lambda function
+    fn feed_batches(&mut self, partitions: Vec<Vec<RecordBatch>>);
 }
 
 /// Return a [wrapper](DisplayableExecutionPlan) around an
@@ -334,7 +345,7 @@ pub async fn collect_partitioned(
 }
 
 /// Partitioning schemes supported by operators.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Partitioning {
     /// Allocate batches using a round-robin algorithm and the specified number of partitions
     RoundRobinBatch(usize),
@@ -342,6 +353,8 @@ pub enum Partitioning {
     /// number of partitions
     /// This partitioning scheme is not yet fully supported. See [ARROW-11011](https://issues.apache.org/jira/browse/ARROW-11011)
     Hash(Vec<Arc<dyn PhysicalExpr>>, usize),
+    /// Use to handle `Partition By` clause.
+    HashDiff(Vec<Arc<dyn PhysicalExpr>>, usize),
     /// Unknown partitioning scheme with a known number of partitions
     UnknownPartitioning(usize),
 }
@@ -353,6 +366,7 @@ impl Partitioning {
         match self {
             RoundRobinBatch(n) => *n,
             Hash(_, n) => *n,
+            HashDiff(_, n) => *n,
             UnknownPartitioning(n) => *n,
         }
     }
@@ -397,6 +411,7 @@ impl ColumnarValue {
 
 /// Expression that can be evaluated against a RecordBatch
 /// A Physical expression knows its type, nullability and how to evaluate itself.
+#[typetag::serde(tag = "physical_expr")]
 pub trait PhysicalExpr: Send + Sync + Display + Debug {
     /// Returns the physical expression as [`Any`](std::any::Any) so that it can be
     /// downcast to a specific implementation.
@@ -414,6 +429,7 @@ pub trait PhysicalExpr: Send + Sync + Display + Debug {
 /// * knows how to create its accumulator
 /// * knows its accumulator's state's field
 /// * knows the expressions from whose its accumulator will receive values
+#[typetag::serde(tag = "aggregate_expr")]
 pub trait AggregateExpr: Send + Sync + Debug {
     /// Returns the aggregate expression as [`Any`](std::any::Any) so that it can be
     /// downcast to a specific implementation.

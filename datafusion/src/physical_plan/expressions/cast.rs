@@ -30,11 +30,13 @@ use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use compute::can_cast_types;
 
+use serde::{Deserialize, Serialize};
+
 /// provide Datafusion default cast options
 pub const DEFAULT_DATAFUSION_CAST_OPTIONS: CastOptions = CastOptions { safe: false };
 
 /// CAST expression casts an expression to a specific data type and returns a runtime error on invalid cast
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CastExpr {
     /// The expression to cast
     expr: Arc<dyn PhysicalExpr>,
@@ -75,6 +77,7 @@ impl fmt::Display for CastExpr {
     }
 }
 
+#[typetag::serde(name = "cast_expr")]
 impl PhysicalExpr for CastExpr {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {

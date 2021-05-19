@@ -24,13 +24,15 @@
 use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
-
-use super::{ExecutionPlan, Partitioning, SendableRecordBatchStream};
+use arrow::record_batch::RecordBatch;
+use super::{ExecutionPlan, LambdaExecPlan, Partitioning, SendableRecordBatchStream};
 use crate::error::Result;
 use async_trait::async_trait;
 
+use serde::{Deserialize, Serialize};
+
 /// UNION ALL execution plan
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UnionExec {
     /// Input execution plan
     inputs: Vec<Arc<dyn ExecutionPlan>>,
@@ -44,9 +46,21 @@ impl UnionExec {
 }
 
 #[async_trait]
+impl LambdaExecPlan for UnionExec {
+    fn feed_batches(&mut self, _partitions: Vec<Vec<RecordBatch>>) {
+        unimplemented!(); 
+    }
+}
+
+#[async_trait]
+#[typetag::serde(name = "union_exec")]
 impl ExecutionPlan for UnionExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 

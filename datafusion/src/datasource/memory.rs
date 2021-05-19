@@ -42,9 +42,12 @@ use super::datasource::ColumnStatistics;
 
 /// In-memory table
 pub struct MemTable {
-    schema: SchemaRef,
-    batches: Vec<Vec<RecordBatch>>,
-    statistics: Statistics,
+    /// Schema
+    pub schema: SchemaRef,
+    /// RecordBatch
+    pub batches: Vec<Vec<RecordBatch>>,
+    /// Statistics
+    pub statistics: Statistics,
 }
 
 // Calculates statistics based on partitions
@@ -161,10 +164,19 @@ impl MemTable {
         }
         MemTable::try_new(schema.clone(), data)
     }
+
+    /// Get batches from MemTable.
+    pub fn batches(&mut self) -> Vec<Vec<RecordBatch>> {
+        std::mem::replace(&mut self.batches, Vec::new())
+    }
 }
 
 impl TableProvider for MemTable {
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 

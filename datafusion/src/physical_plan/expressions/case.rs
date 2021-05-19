@@ -24,6 +24,8 @@ use arrow::compute::{eq, eq_utf8};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 
+use serde::{Deserialize, Serialize};
+
 /// The CASE expression is similar to a series of nested if/else and there are two forms that
 /// can be used. The first form consists of a series of boolean "when" expressions with
 /// corresponding "then" expressions, and an optional "else" expression.
@@ -41,7 +43,7 @@ use arrow::record_batch::RecordBatch;
 ///     [WHEN ...]
 ///     [ELSE result]
 /// END
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CaseExpr {
     /// Optional base expression that can be compared to literal values in the "when" expressions
     expr: Option<Arc<dyn PhysicalExpr>>,
@@ -388,6 +390,7 @@ impl CaseExpr {
     }
 }
 
+#[typetag::serde(name = "case_expr")]
 impl PhysicalExpr for CaseExpr {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {

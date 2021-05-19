@@ -25,9 +25,11 @@ use crate::logical_plan::Expr;
 use crate::physical_plan::ExecutionPlan;
 use crate::{arrow::datatypes::SchemaRef, scalar::ScalarValue};
 
+use serde::{Deserialize, Serialize};
+
 /// This table statistics are estimates.
 /// It can not be used directly in the precise compute
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Statistics {
     /// The number of table rows
     pub num_rows: Option<usize>,
@@ -37,7 +39,7 @@ pub struct Statistics {
     pub column_statistics: Option<Vec<ColumnStatistics>>,
 }
 /// This table statistics are estimates about column
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ColumnStatistics {
     /// Number of null values on column
     pub null_count: Option<usize>,
@@ -82,6 +84,9 @@ pub trait TableProvider: Sync + Send {
     /// Returns the table provider as [`Any`](std::any::Any) so that it can be
     /// downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
+
+    /// Return the value as an mutable Any to allow for downcasts without transmutation
+    fn as_mut_any(&mut self) -> &mut dyn Any;
 
     /// Get a reference to the schema for this table
     fn schema(&self) -> SchemaRef;

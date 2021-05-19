@@ -24,7 +24,7 @@ use std::task::{Context, Poll};
 use std::{any::Any, collections::HashMap, vec};
 
 use crate::error::{DataFusionError, Result};
-use crate::physical_plan::{DisplayFormatType, ExecutionPlan, Partitioning};
+use crate::physical_plan::{DisplayFormatType, LambdaExecPlan, ExecutionPlan, Partitioning};
 use arrow::record_batch::RecordBatch;
 use arrow::{array::Array, error::Result as ArrowResult};
 use arrow::{compute::take, datatypes::SchemaRef};
@@ -41,11 +41,13 @@ use tokio::sync::{
 };
 use tokio::task::JoinHandle;
 
+use serde::{Deserialize, Serialize};
+
 type MaybeBatch = Option<ArrowResult<RecordBatch>>;
 
 /// The repartition operator maps N input partitions to M output partitions based on a
 /// partitioning scheme. No guarantees are made about the order of the resulting partitions.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RepartitionExec {
     /// Input execution plan
     input: Arc<dyn ExecutionPlan>,
@@ -53,6 +55,7 @@ pub struct RepartitionExec {
     partitioning: Partitioning,
     /// Channels for sending batches from input partitions to output partitions.
     /// Key is the partition number
+    #[serde(skip)]
     channels: Arc<
         Mutex<
             HashMap<usize, (UnboundedSender<MaybeBatch>, UnboundedReceiver<MaybeBatch>)>,
@@ -73,9 +76,14 @@ impl RepartitionExec {
 }
 
 #[async_trait]
+#[typetag::serde(name = "repartition_exec")]
 impl ExecutionPlan for RepartitionExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -204,6 +212,57 @@ impl ExecutionPlan for RepartitionExec {
                                     })?;
                                 }
                             }
+                            Partitioning::HashDiff(exprs, _) => {
+                                let input_batch = result?;
+                                let arrays = exprs
+                                    .iter()
+                                    .map(|expr| {
+                                        Ok(expr
+                                            .evaluate(&input_batch)?
+                                            .into_array(input_batch.num_rows()))
+                                    })
+                                    .collect::<Result<Vec<_>>>()?;
+                                hashes_buf.clear();
+                                hashes_buf.resize(arrays[0].len(), 0);
+                                // Hash arrays and compute buckets based on number of partitions
+                                let hashes =
+                                    create_hashes(&arrays, &random_state, hashes_buf)?;
+                                let mut indices = HashMap::new();
+                                for (index, hash) in hashes.iter().enumerate() {
+                                    if indices.get(&hash).is_none() {
+                                        indices.insert(hash, vec![index as u64]);
+                                    } else {
+                                        indices.get_mut(&hash).unwrap().push(index as u64);
+                                    }
+                                }
+                                for (num_output_partition, (_, partition_indices)) in
+                                    indices.into_iter().enumerate()
+                                {
+                                    let indices = partition_indices.into();
+                                    // Produce batches based on indices
+                                    let columns = input_batch
+                                        .columns()
+                                        .iter()
+                                        .map(|c| {
+                                            take(c.as_ref(), &indices, None).map_err(
+                                                |e| {
+                                                    DataFusionError::Execution(
+                                                        e.to_string(),
+                                                    )
+                                                },
+                                            )
+                                        })
+                                        .collect::<Result<Vec<Arc<dyn Array>>>>()?;
+                                    let output_batch = RecordBatch::try_new(
+                                        input_batch.schema(),
+                                        columns,
+                                    );
+                                    let tx = txs.get_mut(&num_output_partition).unwrap();
+                                    tx.send(Some(output_batch)).map_err(|e| {
+                                        DataFusionError::Execution(e.to_string())
+                                    })?;
+                                }                                   
+                            }
                             other => {
                                 // this should be unreachable as long as the validation logic
                                 // in the constructor is kept up-to-date
@@ -246,6 +305,13 @@ impl ExecutionPlan for RepartitionExec {
                 write!(f, "RepartitionExec: partitioning={:?}", self.partitioning)
             }
         }
+    }
+}
+
+#[async_trait]
+impl LambdaExecPlan for RepartitionExec {
+    fn feed_batches(&mut self, _partitions: Vec<Vec<RecordBatch>>) {
+        unimplemented!();
     }
 }
 

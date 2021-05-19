@@ -19,8 +19,10 @@ use std::{fmt, ops};
 
 use super::{binary_expr, Expr};
 
+use serde::{Deserialize, Serialize};
+
 /// Operators applied to expressions
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Operator {
     /// Expressions are equal
     Eq,

@@ -26,8 +26,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::error::{DataFusionError, Result};
+use crate::physical_plan::memory::MemoryExec;
 use crate::physical_plan::{
-    DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr,
+    DisplayFormatType, LambdaExecPlan, ExecutionPlan, Partitioning, PhysicalExpr,
 };
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::error::Result as ArrowResult;
@@ -39,8 +40,10 @@ use async_trait::async_trait;
 use futures::stream::Stream;
 use futures::stream::StreamExt;
 
+use serde::{Deserialize, Serialize};
+
 /// Execution plan for a projection
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ProjectionExec {
     /// The projection expressions stored as tuples of (expression, output column name)
     expr: Vec<(Arc<dyn PhysicalExpr>, String)>,
@@ -78,6 +81,20 @@ impl ProjectionExec {
         })
     }
 
+    /// Get new orphan of execution plan
+    pub fn new_orphan(&self) -> Arc<ProjectionExec> {
+        let mut projection = None;
+        if let Some(memory_exec) = self.input().as_any().downcast_ref::<MemoryExec>() {
+            projection = memory_exec.projection().clone();
+        }
+        let memory_exec = MemoryExec::try_new(&vec![], self.schema(), projection).unwrap();
+        Arc::new(ProjectionExec {
+            input: Arc::new(memory_exec),
+            schema: self.schema.clone(),
+            expr: self.expr.clone(),
+        })
+    }
+
     /// The projection expressions stored as tuples of (expression, output column name)
     pub fn expr(&self) -> &[(Arc<dyn PhysicalExpr>, String)] {
         &self.expr
@@ -90,9 +107,25 @@ impl ProjectionExec {
 }
 
 #[async_trait]
+impl LambdaExecPlan for ProjectionExec {
+    fn feed_batches(&mut self, partitions: Vec<Vec<RecordBatch>>) {
+        self.input = Arc::new(MemoryExec {
+            partitions,
+            schema: self.schema(),
+            projection: None,
+        });
+    }
+}
+
+#[async_trait]
+#[typetag::serde(name = "projection_exec")]
 impl ExecutionPlan for ProjectionExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 

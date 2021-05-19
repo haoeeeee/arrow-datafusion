@@ -29,8 +29,10 @@ use arrow::array::BooleanArray;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 
+use serde::{Deserialize, Serialize};
+
 /// Not expression
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct NotExpr {
     /// Input expression
     arg: Arc<dyn PhysicalExpr>,
@@ -54,6 +56,7 @@ impl fmt::Display for NotExpr {
     }
 }
 
+#[typetag::serde(name = "not_expr")]
 impl PhysicalExpr for NotExpr {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {

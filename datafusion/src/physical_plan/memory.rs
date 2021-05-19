@@ -26,6 +26,7 @@ use super::{
     DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
     SendableRecordBatchStream,
 };
+use crate::physical_plan::LambdaExecPlan;
 use crate::error::{DataFusionError, Result};
 use arrow::datatypes::SchemaRef;
 use arrow::error::Result as ArrowResult;
@@ -34,14 +35,18 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use futures::Stream;
 
+use serde::{Deserialize, Serialize};
+
 /// Execution plan for reading in-memory batches of data
+#[derive(Serialize, Deserialize, Clone)]
 pub struct MemoryExec {
     /// The partitions to query
-    partitions: Vec<Vec<RecordBatch>>,
+    #[serde(skip)]
+    pub partitions: Vec<Vec<RecordBatch>>,
     /// Schema representing the data after the optional projection is applied
-    schema: SchemaRef,
+    pub schema: SchemaRef,
     /// Optional projection
-    projection: Option<Vec<usize>>,
+    pub projection: Option<Vec<usize>>,
 }
 
 impl fmt::Debug for MemoryExec {
@@ -53,9 +58,14 @@ impl fmt::Debug for MemoryExec {
 }
 
 #[async_trait]
+#[typetag::serde(name = "memory_exec")]
 impl ExecutionPlan for MemoryExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -112,6 +122,13 @@ impl ExecutionPlan for MemoryExec {
     }
 }
 
+#[async_trait]
+impl LambdaExecPlan for MemoryExec {
+    fn feed_batches(&mut self, _partitions: Vec<Vec<RecordBatch>>) {
+        unimplemented!();
+    }
+}
+
 impl MemoryExec {
     /// Create a new execution plan for reading in-memory record batches
     pub fn try_new(
@@ -124,6 +141,22 @@ impl MemoryExec {
             schema,
             projection,
         })
+    }
+
+    /// Set the partitions and schema
+    pub fn set_partitions_and_schema(&mut self, partitions: &Vec<Vec<RecordBatch>>, schema: SchemaRef) {
+        self.partitions = partitions.clone();
+        self.schema = schema;
+    }
+
+    /// Set the partitions
+    pub fn set_partitions(&mut self, partitions: &Vec<Vec<RecordBatch>>) {
+        self.partitions = partitions.clone();
+    }
+
+    /// Get the projection
+    pub fn projection(&self) -> &Option<Vec<usize>> {
+        &self.projection
     }
 }
 

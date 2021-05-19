@@ -19,7 +19,7 @@ use std::{any::Any, sync::Arc};
 
 use arrow::array::*;
 use arrow::compute::kernels::arithmetic::{
-    add, divide, divide_scalar, multiply, subtract,
+    add, divide, divide_scalar, multiply, subtract, modulus, modulus_scalar
 };
 use arrow::compute::kernels::boolean::{and_kleene, or_kleene};
 use arrow::compute::kernels::comparison::{eq, gt, gt_eq, lt, lt_eq, neq};
@@ -45,8 +45,10 @@ use crate::scalar::ScalarValue;
 
 use super::coercion::{eq_coercion, numerical_coercion, order_coercion, string_coercion};
 
+use serde::{Deserialize, Serialize};
+
 /// Binary expression
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BinaryExpr {
     left: Arc<dyn PhysicalExpr>,
     op: Operator,
@@ -341,13 +343,8 @@ fn common_binary_type(
         }
         // for math expressions, the final value of the coercion is also the return type
         // because coercion favours higher information types
-        Operator::Plus | Operator::Minus | Operator::Divide | Operator::Multiply => {
+        Operator::Plus | Operator::Minus | Operator::Modulus | Operator::Divide | Operator::Multiply => {
             numerical_coercion(lhs_type, rhs_type)
-        }
-        Operator::Modulus => {
-            return Err(DataFusionError::NotImplemented(
-                "Modulus operator is still not supported".to_string(),
-            ))
         }
     };
 
@@ -389,15 +386,13 @@ pub fn binary_operator_data_type(
         | Operator::GtEq
         | Operator::LtEq => Ok(DataType::Boolean),
         // math operations return the same value as the common coerced type
-        Operator::Plus | Operator::Minus | Operator::Divide | Operator::Multiply => {
+        Operator::Plus | Operator::Minus | Operator::Divide | Operator::Multiply | Operator::Modulus => {
             Ok(common_type)
         }
-        Operator::Modulus => Err(DataFusionError::NotImplemented(
-            "Modulus operator is still not supported".to_string(),
-        )),
     }
 }
 
+#[typetag::serde(name = "binary_expr")]
 impl PhysicalExpr for BinaryExpr {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
@@ -454,6 +449,9 @@ impl PhysicalExpr for BinaryExpr {
                     Operator::Divide => {
                         binary_primitive_array_op_scalar!(array, scalar.clone(), divide)
                     }
+                    Operator::Modulus => {
+                        binary_primitive_array_op_scalar!(array, scalar.clone(), modulus)
+                    }
                     // if scalar operation is not supported - fallback to array implementation
                     _ => None,
                 }
@@ -503,6 +501,7 @@ impl PhysicalExpr for BinaryExpr {
             Operator::Minus => binary_primitive_array_op!(left, right, subtract),
             Operator::Multiply => binary_primitive_array_op!(left, right, multiply),
             Operator::Divide => binary_primitive_array_op!(left, right, divide),
+            Operator::Modulus => binary_primitive_array_op!(left, right, modulus),
             Operator::And => {
                 if left_data_type == DataType::Boolean {
                     boolean_op!(left, right, and_kleene)
@@ -525,9 +524,6 @@ impl PhysicalExpr for BinaryExpr {
                     )));
                 }
             }
-            Operator::Modulus => Err(DataFusionError::NotImplemented(
-                "Modulus operator is still not supported".to_string(),
-            )),
         };
         result.map(|a| ColumnarValue::Array(a))
     }
