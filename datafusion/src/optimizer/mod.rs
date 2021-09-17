@@ -21,8 +21,8 @@
 pub mod constant_folding;
 pub mod eliminate_limit;
 pub mod filter_push_down;
-pub mod hash_build_probe_order;
 pub mod limit_push_down;
 pub mod optimizer;
 pub mod projection_push_down;
+pub mod simplify_expressions;
 pub mod utils;

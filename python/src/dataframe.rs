@@ -28,6 +28,7 @@ use datafusion::{execution::context::ExecutionContextState, logical_plan};
 
 use crate::{errors, to_py};
 use crate::{errors::DataFusionError, expression};
+use datafusion::arrow::util::pretty;
 
 /// A DataFrame is a representation of a logical plan and an API to compose statements.
 /// Use it to build a plan and `.collect()` to execute the plan and collect the result.
@@ -51,7 +52,7 @@ impl DataFrame {
     #[args(args = "*")]
     fn select(&self, args: &PyTuple) -> PyResult<Self> {
         let expressions = expression::from_tuple(args)?;
-        let builder = LogicalPlanBuilder::from(&self.plan);
+        let builder = LogicalPlanBuilder::from(self.plan.clone());
         let builder =
             errors::wrap(builder.project(expressions.into_iter().map(|e| e.expr)))?;
         let plan = errors::wrap(builder.build())?;
@@ -64,7 +65,7 @@ impl DataFrame {
 
     /// Filter according to the `predicate` expression
     fn filter(&self, predicate: expression::Expression) -> PyResult<Self> {
-        let builder = LogicalPlanBuilder::from(&self.plan);
+        let builder = LogicalPlanBuilder::from(self.plan.clone());
         let builder = errors::wrap(builder.filter(predicate.expr))?;
         let plan = errors::wrap(builder.build())?;
 
@@ -80,7 +81,7 @@ impl DataFrame {
         group_by: Vec<expression::Expression>,
         aggs: Vec<expression::Expression>,
     ) -> PyResult<Self> {
-        let builder = LogicalPlanBuilder::from(&self.plan);
+        let builder = LogicalPlanBuilder::from(self.plan.clone());
         let builder = errors::wrap(builder.aggregate(
             group_by.into_iter().map(|e| e.expr),
             aggs.into_iter().map(|e| e.expr),
@@ -93,9 +94,21 @@ impl DataFrame {
         })
     }
 
+    /// Sort by specified sorting expressions
+    fn sort(&self, exprs: Vec<expression::Expression>) -> PyResult<Self> {
+        let exprs = exprs.into_iter().map(|e| e.expr);
+        let builder = LogicalPlanBuilder::from(self.plan.clone());
+        let builder = errors::wrap(builder.sort(exprs))?;
+        let plan = errors::wrap(builder.build())?;
+        Ok(DataFrame {
+            ctx_state: self.ctx_state.clone(),
+            plan,
+        })
+    }
+
     /// Limits the plan to return at most `count` rows
     fn limit(&self, count: usize) -> PyResult<Self> {
-        let builder = LogicalPlanBuilder::from(&self.plan);
+        let builder = LogicalPlanBuilder::from(self.plan.clone());
         let builder = errors::wrap(builder.limit(count))?;
         let plan = errors::wrap(builder.build())?;
 
@@ -127,14 +140,43 @@ impl DataFrame {
         to_py::to_py(&batches)
     }
 
+    /// Print the result, 20 lines by default
+    #[args(num = "20")]
+    fn show(&self, py: Python, num: usize) -> PyResult<()> {
+        let ctx = _ExecutionContext::from(self.ctx_state.clone());
+        let plan = ctx
+            .optimize(&self.limit(num)?.plan)
+            .and_then(|plan| ctx.create_physical_plan(&plan))
+            .map_err(|e| -> errors::DataFusionError { e.into() })?;
+
+        let rt = Runtime::new().unwrap();
+        let batches = py.allow_threads(|| {
+            rt.block_on(async {
+                collect(plan)
+                    .await
+                    .map_err(|e| -> errors::DataFusionError { e.into() })
+            })
+        })?;
+
+        Ok(pretty::print_batches(&batches).unwrap())
+    }
+
     /// Returns the join of two DataFrames `on`.
-    fn join(&self, right: &DataFrame, on: Vec<&str>, how: &str) -> PyResult<Self> {
-        let builder = LogicalPlanBuilder::from(&self.plan);
+    fn join(
+        &self,
+        right: &DataFrame,
+        join_keys: (Vec<&str>, Vec<&str>),
+        how: &str,
+    ) -> PyResult<Self> {
+        let builder = LogicalPlanBuilder::from(self.plan.clone());
 
         let join_type = match how {
             "inner" => JoinType::Inner,
             "left" => JoinType::Left,
             "right" => JoinType::Right,
+            "full" => JoinType::Full,
+            "semi" => JoinType::Semi,
+            "anti" => JoinType::Anti,
             how => {
                 return Err(DataFusionError::Common(format!(
                     "The join type {} does not exist or is not implemented",
@@ -144,12 +186,7 @@ impl DataFrame {
             }
         };
 
-        let builder = errors::wrap(builder.join(
-            &right.plan,
-            join_type,
-            on.as_slice(),
-            on.as_slice(),
-        ))?;
+        let builder = errors::wrap(builder.join(&right.plan, join_type, join_keys))?;
 
         let plan = errors::wrap(builder.build())?;
 

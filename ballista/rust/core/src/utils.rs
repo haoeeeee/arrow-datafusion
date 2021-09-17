@@ -23,41 +23,55 @@ use std::sync::Arc;
 use std::{fs::File, pin::Pin};
 
 use crate::error::{BallistaError, Result};
-use crate::execution_plans::{QueryStageExec, UnresolvedShuffleExec};
+use crate::execution_plans::{
+    DistributedQueryExec, ShuffleWriterExec, UnresolvedShuffleExec,
+};
 use crate::memory_stream::MemoryStream;
 use crate::serde::scheduler::PartitionStats;
-use arrow::array::{
-    ArrayBuilder, ArrayRef, StructArray, StructBuilder, UInt64Array, UInt64Builder,
+
+use crate::config::BallistaConfig;
+use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::error::Result as ArrowResult;
+use datafusion::arrow::{
+    array::{
+        ArrayBuilder, ArrayRef, StructArray, StructBuilder, UInt64Array, UInt64Builder,
+    },
+    datatypes::{DataType, Field, SchemaRef},
+    ipc::reader::FileReader,
+    ipc::writer::FileWriter,
+    record_batch::RecordBatch,
 };
-use arrow::datatypes::{DataType, Field};
-use arrow::ipc::reader::FileReader;
-use arrow::ipc::writer::FileWriter;
-use arrow::record_batch::RecordBatch;
-use datafusion::execution::context::{ExecutionConfig, ExecutionContext};
-use datafusion::logical_plan::Operator;
+use datafusion::error::DataFusionError;
+use datafusion::execution::context::{
+    ExecutionConfig, ExecutionContext, ExecutionContextState, QueryPlanner,
+};
+use datafusion::logical_plan::{LogicalPlan, Operator};
 use datafusion::physical_optimizer::coalesce_batches::CoalesceBatches;
-use datafusion::physical_optimizer::merge_exec::AddMergeExec;
+use datafusion::physical_optimizer::merge_exec::AddCoalescePartitionsExec;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::csv::CsvExec;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions::{BinaryExpr, Column, Literal};
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::hash_aggregate::HashAggregateExec;
 use datafusion::physical_plan::hash_join::HashJoinExec;
-use datafusion::physical_plan::merge::MergeExec;
 use datafusion::physical_plan::parquet::ParquetExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sort::SortExec;
 use datafusion::physical_plan::{
-    AggregateExpr, ExecutionPlan, PhysicalExpr, RecordBatchStream,
+    metrics, AggregateExpr, ExecutionPlan, Metric, PhysicalExpr, RecordBatchStream,
 };
-use futures::StreamExt;
+use futures::{future, Stream, StreamExt};
+use std::time::Instant;
 
 /// Stream data to disk in Arrow IPC format
 
 pub async fn write_stream_to_disk(
     stream: &mut Pin<Box<dyn RecordBatchStream + Send + Sync>>,
     path: &str,
+    disk_write_metric: &metrics::Time,
 ) -> Result<PartitionStats> {
     let file = File::create(&path).map_err(|e| {
         BallistaError::General(format!(
@@ -82,9 +96,14 @@ pub async fn write_stream_to_disk(
         num_batches += 1;
         num_rows += batch.num_rows();
         num_bytes += batch_size_bytes;
+
+        let timer = disk_write_metric.timer();
         writer.write(&batch)?;
+        timer.done();
     }
+    let timer = disk_write_metric.timer();
     writer.finish()?;
+    timer.done();
     Ok(PartitionStats::new(
         Some(num_rows as u64),
         Some(num_batches),
@@ -102,115 +121,20 @@ pub async fn collect_stream(
     Ok(batches)
 }
 
-pub fn format_plan(plan: &dyn ExecutionPlan, indent: usize) -> Result<String> {
-    let operator_str =
-        if let Some(exec) = plan.as_any().downcast_ref::<HashAggregateExec>() {
-            format!(
-                "HashAggregateExec: groupBy={:?}, aggrExpr={:?}",
-                exec.group_expr()
-                    .iter()
-                    .map(|e| format_expr(e.0.as_ref()))
-                    .collect::<Vec<String>>(),
-                exec.aggr_expr()
-                    .iter()
-                    .map(|e| format_agg_expr(e.as_ref()))
-                    .collect::<Result<Vec<String>>>()?
-            )
-        } else if let Some(exec) = plan.as_any().downcast_ref::<HashJoinExec>() {
-            format!(
-                "HashJoinExec: joinType={:?}, on={:?}",
-                exec.join_type(),
-                exec.on()
-            )
-        } else if let Some(exec) = plan.as_any().downcast_ref::<ParquetExec>() {
-            let mut num_files = 0;
-            for part in exec.partitions() {
-                num_files += part.filenames().len();
-            }
-            format!(
-                "ParquetExec: partitions={}, files={}",
-                exec.partitions().len(),
-                num_files
-            )
-        } else if let Some(exec) = plan.as_any().downcast_ref::<CsvExec>() {
-            format!(
-                "CsvExec: {}; partitions={}",
-                &exec.path(),
-                exec.output_partitioning().partition_count()
-            )
-        } else if let Some(exec) = plan.as_any().downcast_ref::<FilterExec>() {
-            format!("FilterExec: {}", format_expr(exec.predicate().as_ref()))
-        } else if let Some(exec) = plan.as_any().downcast_ref::<QueryStageExec>() {
-            format!(
-                "QueryStageExec: job={}, stage={}",
-                exec.job_id, exec.stage_id
-            )
-        } else if let Some(exec) = plan.as_any().downcast_ref::<UnresolvedShuffleExec>() {
-            format!("UnresolvedShuffleExec: stages={:?}", exec.query_stage_ids)
-        } else if let Some(exec) = plan.as_any().downcast_ref::<CoalesceBatchesExec>() {
-            format!(
-                "CoalesceBatchesExec: batchSize={}",
-                exec.target_batch_size()
-            )
-        } else if plan.as_any().downcast_ref::<MergeExec>().is_some() {
-            "MergeExec".to_string()
-        } else {
-            let str = format!("{:?}", plan);
-            String::from(&str[0..120])
-        };
-
-    let children_str = plan
-        .children()
-        .iter()
-        .map(|c| format_plan(c.as_ref(), indent + 1))
-        .collect::<Result<Vec<String>>>()?
-        .join("\n");
-
-    let indent_str = "  ".repeat(indent);
-    if plan.children().is_empty() {
-        Ok(format!("{}{}{}", indent_str, &operator_str, children_str))
-    } else {
-        Ok(format!("{}{}\n{}", indent_str, &operator_str, children_str))
-    }
-}
-
-pub fn format_agg_expr(expr: &dyn AggregateExpr) -> Result<String> {
-    Ok(format!(
-        "{} {:?}",
-        expr.field()?.name(),
-        expr.expressions()
-            .iter()
-            .map(|e| format_expr(e.as_ref()))
-            .collect::<Vec<String>>()
-    ))
-}
-
-pub fn format_expr(expr: &dyn PhysicalExpr) -> String {
-    if let Some(e) = expr.as_any().downcast_ref::<Column>() {
-        e.name().to_string()
-    } else if let Some(e) = expr.as_any().downcast_ref::<Literal>() {
-        e.to_string()
-    } else if let Some(e) = expr.as_any().downcast_ref::<BinaryExpr>() {
-        format!("{} {} {}", e.left(), e.op(), e.right())
-    } else {
-        format!("{}", expr)
-    }
-}
-
-pub fn produce_diagram(filename: &str, stages: &[Arc<QueryStageExec>]) -> Result<()> {
+pub fn produce_diagram(filename: &str, stages: &[Arc<ShuffleWriterExec>]) -> Result<()> {
     let write_file = File::create(filename)?;
     let mut w = BufWriter::new(&write_file);
     writeln!(w, "digraph G {{")?;
 
     // draw stages and entities
     for stage in stages {
-        writeln!(w, "\tsubgraph cluster{} {{", stage.stage_id)?;
-        writeln!(w, "\t\tlabel = \"Stage {}\";", stage.stage_id)?;
+        writeln!(w, "\tsubgraph cluster{} {{", stage.stage_id())?;
+        writeln!(w, "\t\tlabel = \"Stage {}\";", stage.stage_id())?;
         let mut id = AtomicUsize::new(0);
         build_exec_plan_diagram(
             &mut w,
-            stage.child.as_ref(),
-            stage.stage_id,
+            stage.children()[0].as_ref(),
+            stage.stage_id(),
             &mut id,
             true,
         )?;
@@ -222,8 +146,8 @@ pub fn produce_diagram(filename: &str, stages: &[Arc<QueryStageExec>]) -> Result
         let mut id = AtomicUsize::new(0);
         build_exec_plan_diagram(
             &mut w,
-            stage.child.as_ref(),
-            stage.stage_id,
+            stage.children()[0].as_ref(),
+            stage.stage_id(),
             &mut id,
             false,
         )?;
@@ -254,8 +178,8 @@ fn build_exec_plan_diagram(
         "CsvExec"
     } else if plan.as_any().downcast_ref::<FilterExec>().is_some() {
         "FilterExec"
-    } else if plan.as_any().downcast_ref::<QueryStageExec>().is_some() {
-        "QueryStageExec"
+    } else if plan.as_any().downcast_ref::<ShuffleWriterExec>().is_some() {
+        "ShuffleWriterExec"
     } else if plan
         .as_any()
         .downcast_ref::<UnresolvedShuffleExec>()
@@ -268,8 +192,12 @@ fn build_exec_plan_diagram(
         .is_some()
     {
         "CoalesceBatchesExec"
-    } else if plan.as_any().downcast_ref::<MergeExec>().is_some() {
-        "MergeExec"
+    } else if plan
+        .as_any()
+        .downcast_ref::<CoalescePartitionsExec>()
+        .is_some()
+    {
+        "CoalescePartitionsExec"
     } else {
         println!("Unknown: {:?}", plan);
         "Unknown"
@@ -288,13 +216,11 @@ fn build_exec_plan_diagram(
     for child in plan.children() {
         if let Some(shuffle) = child.as_any().downcast_ref::<UnresolvedShuffleExec>() {
             if !draw_entity {
-                for y in &shuffle.query_stage_ids {
-                    writeln!(
-                        w,
-                        "\tstage_{}_exec_1 -> stage_{}_exec_{};",
-                        y, stage_id, node_id
-                    )?;
-                }
+                writeln!(
+                    w,
+                    "\tstage_{}_exec_1 -> stage_{}_exec_{};",
+                    shuffle.stage_id, stage_id, node_id
+                )?;
             }
         } else {
             // relationships within same entity
@@ -312,17 +238,88 @@ fn build_exec_plan_diagram(
     Ok(node_id)
 }
 
-/// Create a DataFusion context that is compatible with Ballista
-pub fn create_datafusion_context() -> ExecutionContext {
-    // remove Repartition rule because that isn't supported yet
-    let rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = vec![
-        Arc::new(CoalesceBatches::new()),
-        Arc::new(AddMergeExec::new()),
-    ];
+/// Create a DataFusion context that uses the BallistaQueryPlanner to send logical plans
+/// to a Ballista scheduler
+pub fn create_df_ctx_with_ballista_query_planner(
+    scheduler_host: &str,
+    scheduler_port: u16,
+    config: &BallistaConfig,
+) -> ExecutionContext {
+    let scheduler_url = format!("http://{}:{}", scheduler_host, scheduler_port);
     let config = ExecutionConfig::new()
-        .with_concurrency(1)
-        .with_repartition_joins(false)
-        .with_repartition_aggregations(false)
-        .with_physical_optimizer_rules(rules);
+        .with_query_planner(Arc::new(BallistaQueryPlanner::new(
+            scheduler_url,
+            config.clone(),
+        )))
+        .with_target_partitions(config.default_shuffle_partitions());
     ExecutionContext::with_config(config)
+}
+
+pub struct BallistaQueryPlanner {
+    scheduler_url: String,
+    config: BallistaConfig,
+}
+
+impl BallistaQueryPlanner {
+    pub fn new(scheduler_url: String, config: BallistaConfig) -> Self {
+        Self {
+            scheduler_url,
+            config,
+        }
+    }
+}
+
+impl QueryPlanner for BallistaQueryPlanner {
+    fn create_physical_plan(
+        &self,
+        logical_plan: &LogicalPlan,
+        _ctx_state: &ExecutionContextState,
+    ) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        match logical_plan {
+            LogicalPlan::CreateExternalTable { .. } => {
+                // table state is managed locally in the BallistaContext, not in the scheduler
+                Ok(Arc::new(EmptyExec::new(false, Arc::new(Schema::empty()))))
+            }
+            _ => Ok(Arc::new(DistributedQueryExec::new(
+                self.scheduler_url.clone(),
+                self.config.clone(),
+                logical_plan.clone(),
+            ))),
+        }
+    }
+}
+
+pub struct WrappedStream {
+    stream: Pin<Box<dyn Stream<Item = ArrowResult<RecordBatch>> + Send + Sync>>,
+    schema: SchemaRef,
+}
+
+impl WrappedStream {
+    pub fn new(
+        stream: Pin<Box<dyn Stream<Item = ArrowResult<RecordBatch>> + Send + Sync>>,
+        schema: SchemaRef,
+    ) -> Self {
+        Self { stream, schema }
+    }
+}
+
+impl RecordBatchStream for WrappedStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+impl Stream for WrappedStream {
+    type Item = ArrowResult<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.stream.poll_next_unpin(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
+    }
 }

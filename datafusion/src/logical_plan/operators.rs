@@ -45,7 +45,7 @@ pub enum Operator {
     /// Division operator, like `/`
     Divide,
     /// Remainder operator, like `%`
-    Modulus,
+    Modulo,
     /// Logical AND, like `&&`
     And,
     /// Logical OR, like `||`
@@ -54,6 +54,14 @@ pub enum Operator {
     Like,
     /// Does not match a wildcard pattern
     NotLike,
+    /// Case sensitive regex match
+    RegexMatch,
+    /// Case insensitive regex match
+    RegexIMatch,
+    /// Case sensitive regex not match
+    RegexNotMatch,
+    /// Case insensitive regex not match
+    RegexNotIMatch,
 }
 
 impl fmt::Display for Operator {
@@ -69,11 +77,15 @@ impl fmt::Display for Operator {
             Operator::Minus => "-",
             Operator::Multiply => "*",
             Operator::Divide => "/",
-            Operator::Modulus => "%",
+            Operator::Modulo => "%",
             Operator::And => "AND",
             Operator::Or => "OR",
             Operator::Like => "LIKE",
             Operator::NotLike => "NOT LIKE",
+            Operator::RegexMatch => "~",
+            Operator::RegexIMatch => "~*",
+            Operator::RegexNotMatch => "!~",
+            Operator::RegexNotIMatch => "!~*",
         };
         write!(f, "{}", display)
     }

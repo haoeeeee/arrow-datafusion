@@ -17,27 +17,32 @@
 
 //! Serde code to convert from protocol buffers to Rust data structures.
 
-use std::{
-    convert::{From, TryInto},
-    unimplemented,
-};
-
 use crate::error::BallistaError;
-use crate::serde::{proto_error, protobuf};
+use crate::serde::{from_proto_binary_op, proto_error, protobuf};
 use crate::{convert_box_required, convert_required};
-
-use arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use datafusion::datasource::parquet::{ParquetTable, ParquetTableDescriptor};
+use datafusion::datasource::{PartitionedFile, TableDescriptor};
+use datafusion::logical_plan::window_frames::{
+    WindowFrame, WindowFrameBound, WindowFrameUnits,
+};
 use datafusion::logical_plan::{
     abs, acos, asin, atan, ceil, cos, exp, floor, ln, log10, log2, round, signum, sin,
-    sqrt, tan, trunc, Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Operator,
+    sqrt, tan, trunc, Column, DFField, DFSchema, Expr, JoinConstraint, JoinType,
+    LogicalPlan, LogicalPlanBuilder, Operator,
 };
 use datafusion::physical_plan::aggregates::AggregateFunction;
+use datafusion::physical_plan::avro::AvroReadOptions;
 use datafusion::physical_plan::csv::CsvReadOptions;
+use datafusion::physical_plan::window_functions::BuiltInWindowFunction;
 use datafusion::scalar::ScalarValue;
 use protobuf::logical_plan_node::LogicalPlanType;
 use protobuf::{logical_expr_node::ExprType, scalar_type};
-
-// use uuid::Uuid;
+use std::{
+    convert::{From, TryInto},
+    sync::Arc,
+    unimplemented,
+};
 
 impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
     type Error = BallistaError;
@@ -57,14 +62,14 @@ impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
                     .iter()
                     .map(|expr| expr.try_into())
                     .collect::<Result<Vec<_>, _>>()?;
-                LogicalPlanBuilder::from(&input)
+                LogicalPlanBuilder::from(input)
                     .project(x)?
                     .build()
                     .map_err(|e| e.into())
             }
             LogicalPlanType::Selection(selection) => {
                 let input: LogicalPlan = convert_box_required!(selection.input)?;
-                LogicalPlanBuilder::from(&input)
+                LogicalPlanBuilder::from(input)
                     .filter(
                         selection
                             .expr
@@ -72,6 +77,18 @@ impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
                             .expect("expression required")
                             .try_into()?,
                     )?
+                    .build()
+                    .map_err(|e| e.into())
+            }
+            LogicalPlanType::Window(window) => {
+                let input: LogicalPlan = convert_box_required!(window.input)?;
+                let window_expr = window
+                    .window_expr
+                    .iter()
+                    .map(|expr| expr.try_into())
+                    .collect::<Result<Vec<_>, _>>()?;
+                LogicalPlanBuilder::from(input)
+                    .window(window_expr)?
                     .build()
                     .map_err(|e| e.into())
             }
@@ -87,7 +104,7 @@ impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
                     .iter()
                     .map(|expr| expr.try_into())
                     .collect::<Result<Vec<_>, _>>()?;
-                LogicalPlanBuilder::from(&input)
+                LogicalPlanBuilder::from(input)
                     .aggregate(group_expr, aggr_expr)?
                     .build()
                     .map_err(|e| e.into())
@@ -101,8 +118,8 @@ impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
                     .has_header(scan.has_header);
 
                 let mut projection = None;
-                if let Some(column_names) = &scan.projection {
-                    let column_indices = column_names
+                if let Some(columns) = &scan.projection {
+                    let column_indices = columns
                         .columns
                         .iter()
                         .map(|name| schema.index_of(name))
@@ -110,15 +127,21 @@ impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
                     projection = Some(column_indices);
                 }
 
-                LogicalPlanBuilder::scan_csv(&scan.path, options, projection)?
-                    .build()
-                    .map_err(|e| e.into())
+                LogicalPlanBuilder::scan_csv_with_name(
+                    &scan.path,
+                    options,
+                    projection,
+                    &scan.table_name,
+                )?
+                .build()
+                .map_err(|e| e.into())
             }
             LogicalPlanType::ParquetScan(scan) => {
+                let descriptor: TableDescriptor = convert_required!(scan.table_desc)?;
                 let projection = match scan.projection.as_ref() {
                     None => None,
                     Some(columns) => {
-                        let schema: Schema = convert_required!(scan.schema)?;
+                        let schema = descriptor.schema.clone();
                         let r: Result<Vec<usize>, _> = columns
                             .columns
                             .iter()
@@ -135,9 +158,45 @@ impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
                         Some(r?)
                     }
                 };
-                LogicalPlanBuilder::scan_parquet(&scan.path, projection, 24)? //TODO concurrency
-                    .build()
-                    .map_err(|e| e.into())
+
+                let parquet_table = ParquetTable::try_new_with_desc(
+                    Arc::new(ParquetTableDescriptor { descriptor }),
+                    24,
+                    true,
+                )?;
+                LogicalPlanBuilder::scan(
+                    &scan.table_name,
+                    Arc::new(parquet_table),
+                    projection,
+                )? //TODO remove hard-coded max_partitions
+                .build()
+                .map_err(|e| e.into())
+            }
+            LogicalPlanType::AvroScan(scan) => {
+                let schema: Schema = convert_required!(scan.schema)?;
+                let options = AvroReadOptions {
+                    schema: Some(Arc::new(schema.clone())),
+                    file_extension: &scan.file_extension,
+                };
+
+                let mut projection = None;
+                if let Some(columns) = &scan.projection {
+                    let column_indices = columns
+                        .columns
+                        .iter()
+                        .map(|name| schema.index_of(name))
+                        .collect::<Result<Vec<usize>, _>>()?;
+                    projection = Some(column_indices);
+                }
+
+                LogicalPlanBuilder::scan_avro_with_name(
+                    &scan.path,
+                    options,
+                    projection,
+                    &scan.table_name,
+                )?
+                .build()
+                .map_err(|e| e.into())
             }
             LogicalPlanType::Sort(sort) => {
                 let input: LogicalPlan = convert_box_required!(sort.input)?;
@@ -146,7 +205,7 @@ impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
                     .iter()
                     .map(|expr| expr.try_into())
                     .collect::<Result<Vec<Expr>, _>>()?;
-                LogicalPlanBuilder::from(&input)
+                LogicalPlanBuilder::from(input)
                     .sort(sort_expr)?
                     .build()
                     .map_err(|e| e.into())
@@ -177,7 +236,7 @@ impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
                     }
                 };
 
-                LogicalPlanBuilder::from(&input)
+                LogicalPlanBuilder::from(input)
                     .repartition(partitioning_scheme)?
                     .build()
                     .map_err(|e| e.into())
@@ -205,25 +264,32 @@ impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
                     has_header: create_extern_table.has_header,
                 })
             }
+            LogicalPlanType::Analyze(analyze) => {
+                let input: LogicalPlan = convert_box_required!(analyze.input)?;
+                LogicalPlanBuilder::from(input)
+                    .explain(analyze.verbose, true)?
+                    .build()
+                    .map_err(|e| e.into())
+            }
             LogicalPlanType::Explain(explain) => {
                 let input: LogicalPlan = convert_box_required!(explain.input)?;
-                LogicalPlanBuilder::from(&input)
-                    .explain(explain.verbose)?
+                LogicalPlanBuilder::from(input)
+                    .explain(explain.verbose, false)?
                     .build()
                     .map_err(|e| e.into())
             }
             LogicalPlanType::Limit(limit) => {
                 let input: LogicalPlan = convert_box_required!(limit.input)?;
-                LogicalPlanBuilder::from(&input)
+                LogicalPlanBuilder::from(input)
                     .limit(limit.limit as usize)?
                     .build()
                     .map_err(|e| e.into())
             }
             LogicalPlanType::Join(join) => {
-                let left_keys: Vec<&str> =
-                    join.left_join_column.iter().map(|i| i.as_str()).collect();
-                let right_keys: Vec<&str> =
-                    join.right_join_column.iter().map(|i| i.as_str()).collect();
+                let left_keys: Vec<Column> =
+                    join.left_join_column.iter().map(|i| i.into()).collect();
+                let right_keys: Vec<Column> =
+                    join.right_join_column.iter().map(|i| i.into()).collect();
                 let join_type =
                     protobuf::JoinType::from_i32(join.join_type).ok_or_else(|| {
                         proto_error(format!(
@@ -231,19 +297,38 @@ impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
                             join.join_type
                         ))
                     })?;
-                let join_type = match join_type {
-                    protobuf::JoinType::Inner => JoinType::Inner,
-                    protobuf::JoinType::Left => JoinType::Left,
-                    protobuf::JoinType::Right => JoinType::Right,
-                    protobuf::JoinType::Full => JoinType::Full,
-                };
-                LogicalPlanBuilder::from(&convert_box_required!(join.left)?)
-                    .join(
+                let join_constraint = protobuf::JoinConstraint::from_i32(
+                    join.join_constraint,
+                )
+                .ok_or_else(|| {
+                    proto_error(format!(
+                        "Received a JoinNode message with unknown JoinConstraint {}",
+                        join.join_constraint
+                    ))
+                })?;
+
+                let builder = LogicalPlanBuilder::from(convert_box_required!(join.left)?);
+                let builder = match join_constraint.into() {
+                    JoinConstraint::On => builder.join(
                         &convert_box_required!(join.right)?,
-                        join_type,
-                        &left_keys,
-                        &right_keys,
-                    )?
+                        join_type.into(),
+                        (left_keys, right_keys),
+                    )?,
+                    JoinConstraint::Using => builder.join_using(
+                        &convert_box_required!(join.right)?,
+                        join_type.into(),
+                        left_keys,
+                    )?,
+                };
+
+                builder.build().map_err(|e| e.into())
+            }
+            LogicalPlanType::CrossJoin(crossjoin) => {
+                let left = convert_box_required!(crossjoin.left)?;
+                let right = convert_box_required!(crossjoin.right)?;
+
+                LogicalPlanBuilder::from(left)
+                    .cross_join(&right)?
                     .build()
                     .map_err(|e| e.into())
             }
@@ -251,28 +336,109 @@ impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
     }
 }
 
-impl TryInto<datafusion::logical_plan::DFSchema> for protobuf::Schema {
+impl TryInto<TableDescriptor> for &protobuf::TableDescriptor {
     type Error = BallistaError;
-    fn try_into(self) -> Result<datafusion::logical_plan::DFSchema, Self::Error> {
-        let schema: Schema = (&self).try_into()?;
-        schema.try_into().map_err(BallistaError::DataFusionError)
+
+    fn try_into(self) -> Result<TableDescriptor, Self::Error> {
+        let partition_files = self
+            .partition_files
+            .iter()
+            .map(|f| f.try_into())
+            .collect::<Result<Vec<PartitionedFile>, _>>()?;
+        let schema = convert_required!(self.schema)?;
+        Ok(TableDescriptor {
+            path: self.path.to_owned(),
+            partition_files,
+            schema: Arc::new(schema),
+        })
     }
 }
 
-impl TryInto<datafusion::logical_plan::DFSchemaRef> for protobuf::Schema {
+impl TryInto<PartitionedFile> for &protobuf::PartitionedFile {
     type Error = BallistaError;
+
+    fn try_into(self) -> Result<PartitionedFile, Self::Error> {
+        let statistics = convert_required!(self.statistics)?;
+        Ok(PartitionedFile {
+            path: self.path.clone(),
+            statistics,
+        })
+    }
+}
+
+impl From<&protobuf::ColumnStats> for ColumnStatistics {
+    fn from(cs: &protobuf::ColumnStats) -> ColumnStatistics {
+        ColumnStatistics {
+            null_count: Some(cs.null_count as usize),
+            max_value: cs.max_value.as_ref().map(|m| m.try_into().unwrap()),
+            min_value: cs.min_value.as_ref().map(|m| m.try_into().unwrap()),
+            distinct_count: Some(cs.distinct_count as usize),
+        }
+    }
+}
+
+impl TryInto<Statistics> for &protobuf::Statistics {
+    type Error = BallistaError;
+
+    fn try_into(self) -> Result<Statistics, Self::Error> {
+        let column_statistics = self.column_stats.iter().map(|s| s.into()).collect();
+        Ok(Statistics {
+            num_rows: Some(self.num_rows as usize),
+            total_byte_size: Some(self.total_byte_size as usize),
+            column_statistics: Some(column_statistics),
+            is_exact: self.is_exact,
+        })
+    }
+}
+
+impl From<&protobuf::Column> for Column {
+    fn from(c: &protobuf::Column) -> Column {
+        let c = c.clone();
+        Column {
+            relation: c.relation.map(|r| r.relation),
+            name: c.name,
+        }
+    }
+}
+
+impl TryInto<DFSchema> for &protobuf::DfSchema {
+    type Error = BallistaError;
+
+    fn try_into(self) -> Result<DFSchema, BallistaError> {
+        let fields = self
+            .columns
+            .iter()
+            .map(|c| c.try_into())
+            .collect::<Result<Vec<DFField>, _>>()?;
+        Ok(DFSchema::new(fields)?)
+    }
+}
+
+impl TryInto<datafusion::logical_plan::DFSchemaRef> for protobuf::DfSchema {
+    type Error = BallistaError;
+
     fn try_into(self) -> Result<datafusion::logical_plan::DFSchemaRef, Self::Error> {
-        use datafusion::logical_plan::ToDFSchema;
-        let schema: Schema = (&self).try_into()?;
-        schema
-            .to_dfschema_ref()
-            .map_err(BallistaError::DataFusionError)
+        let dfschema: DFSchema = (&self).try_into()?;
+        Ok(Arc::new(dfschema))
     }
 }
 
-impl TryInto<arrow::datatypes::DataType> for &protobuf::scalar_type::Datatype {
+impl TryInto<DFField> for &protobuf::DfField {
     type Error = BallistaError;
-    fn try_into(self) -> Result<arrow::datatypes::DataType, Self::Error> {
+
+    fn try_into(self) -> Result<DFField, Self::Error> {
+        let field: Field = convert_required!(self.field)?;
+
+        Ok(match &self.qualifier {
+            Some(q) => DFField::from_qualified(&q.relation, field),
+            None => DFField::from(field),
+        })
+    }
+}
+
+impl TryInto<DataType> for &protobuf::scalar_type::Datatype {
+    type Error = BallistaError;
+    fn try_into(self) -> Result<DataType, Self::Error> {
         use protobuf::scalar_type::Datatype;
         Ok(match self {
             Datatype::Scalar(scalar_type) => {
@@ -303,167 +469,23 @@ impl TryInto<arrow::datatypes::DataType> for &protobuf::scalar_type::Datatype {
                     ))
                 })?;
                 //Because length is checked above it is safe to unwrap .last()
-                let mut scalar_type =
-                    arrow::datatypes::DataType::List(Box::new(Field::new(
-                        field_names.last().unwrap().as_str(),
-                        pb_scalar_type.into(),
-                        true,
-                    )));
+                let mut scalar_type = DataType::List(Box::new(Field::new(
+                    field_names.last().unwrap().as_str(),
+                    pb_scalar_type.into(),
+                    true,
+                )));
                 //Iterate over field names in reverse order except for the last item in the vector
                 for name in field_names.iter().rev().skip(1) {
-                    let new_datatype = arrow::datatypes::DataType::List(Box::new(
-                        Field::new(name.as_str(), scalar_type, true),
-                    ));
+                    let new_datatype = DataType::List(Box::new(Field::new(
+                        name.as_str(),
+                        scalar_type,
+                        true,
+                    )));
                     scalar_type = new_datatype;
                 }
                 scalar_type
             }
         })
-    }
-}
-
-impl TryInto<arrow::datatypes::DataType> for &protobuf::arrow_type::ArrowTypeEnum {
-    type Error = BallistaError;
-    fn try_into(self) -> Result<arrow::datatypes::DataType, Self::Error> {
-        use arrow::datatypes::DataType;
-        use protobuf::arrow_type;
-        Ok(match self {
-            arrow_type::ArrowTypeEnum::None(_) => DataType::Null,
-            arrow_type::ArrowTypeEnum::Bool(_) => DataType::Boolean,
-            arrow_type::ArrowTypeEnum::Uint8(_) => DataType::UInt8,
-            arrow_type::ArrowTypeEnum::Int8(_) => DataType::Int8,
-            arrow_type::ArrowTypeEnum::Uint16(_) => DataType::UInt16,
-            arrow_type::ArrowTypeEnum::Int16(_) => DataType::Int16,
-            arrow_type::ArrowTypeEnum::Uint32(_) => DataType::UInt32,
-            arrow_type::ArrowTypeEnum::Int32(_) => DataType::Int32,
-            arrow_type::ArrowTypeEnum::Uint64(_) => DataType::UInt64,
-            arrow_type::ArrowTypeEnum::Int64(_) => DataType::Int64,
-            arrow_type::ArrowTypeEnum::Float16(_) => DataType::Float16,
-            arrow_type::ArrowTypeEnum::Float32(_) => DataType::Float32,
-            arrow_type::ArrowTypeEnum::Float64(_) => DataType::Float64,
-            arrow_type::ArrowTypeEnum::Utf8(_) => DataType::Utf8,
-            arrow_type::ArrowTypeEnum::LargeUtf8(_) => DataType::LargeUtf8,
-            arrow_type::ArrowTypeEnum::Binary(_) => DataType::Binary,
-            arrow_type::ArrowTypeEnum::FixedSizeBinary(size) => {
-                DataType::FixedSizeBinary(*size)
-            }
-            arrow_type::ArrowTypeEnum::LargeBinary(_) => DataType::LargeBinary,
-            arrow_type::ArrowTypeEnum::Date32(_) => DataType::Date32,
-            arrow_type::ArrowTypeEnum::Date64(_) => DataType::Date64,
-            arrow_type::ArrowTypeEnum::Duration(time_unit) => {
-                DataType::Duration(protobuf::TimeUnit::from_i32_to_arrow(*time_unit)?)
-            }
-            arrow_type::ArrowTypeEnum::Timestamp(protobuf::Timestamp {
-                time_unit,
-                timezone,
-            }) => DataType::Timestamp(
-                protobuf::TimeUnit::from_i32_to_arrow(*time_unit)?,
-                match timezone.len() {
-                    0 => None,
-                    _ => Some(timezone.to_owned()),
-                },
-            ),
-            arrow_type::ArrowTypeEnum::Time32(time_unit) => {
-                DataType::Time32(protobuf::TimeUnit::from_i32_to_arrow(*time_unit)?)
-            }
-            arrow_type::ArrowTypeEnum::Time64(time_unit) => {
-                DataType::Time64(protobuf::TimeUnit::from_i32_to_arrow(*time_unit)?)
-            }
-            arrow_type::ArrowTypeEnum::Interval(interval_unit) => DataType::Interval(
-                protobuf::IntervalUnit::from_i32_to_arrow(*interval_unit)?,
-            ),
-            arrow_type::ArrowTypeEnum::Decimal(protobuf::Decimal {
-                whole,
-                fractional,
-            }) => DataType::Decimal(*whole as usize, *fractional as usize),
-            arrow_type::ArrowTypeEnum::List(list) => {
-                let list_type: &protobuf::Field = list
-                    .as_ref()
-                    .field_type
-                    .as_ref()
-                    .ok_or_else(|| proto_error("Protobuf deserialization error: List message missing required field 'field_type'"))?
-                    .as_ref();
-                DataType::List(Box::new(list_type.try_into()?))
-            }
-            arrow_type::ArrowTypeEnum::LargeList(list) => {
-                let list_type: &protobuf::Field = list
-                    .as_ref()
-                    .field_type
-                    .as_ref()
-                    .ok_or_else(|| proto_error("Protobuf deserialization error: List message missing required field 'field_type'"))?
-                    .as_ref();
-                DataType::LargeList(Box::new(list_type.try_into()?))
-            }
-            arrow_type::ArrowTypeEnum::FixedSizeList(list) => {
-                let list_type: &protobuf::Field = list
-                    .as_ref()
-                    .field_type
-                    .as_ref()
-                    .ok_or_else(|| proto_error("Protobuf deserialization error: List message missing required field 'field_type'"))?
-                    .as_ref();
-                let list_size = list.list_size;
-                DataType::FixedSizeList(Box::new(list_type.try_into()?), list_size)
-            }
-            arrow_type::ArrowTypeEnum::Struct(strct) => DataType::Struct(
-                strct
-                    .sub_field_types
-                    .iter()
-                    .map(|field| field.try_into())
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
-            arrow_type::ArrowTypeEnum::Union(union) => DataType::Union(
-                union
-                    .union_types
-                    .iter()
-                    .map(|field| field.try_into())
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
-            arrow_type::ArrowTypeEnum::Dictionary(dict) => {
-                let pb_key_datatype = dict
-                    .as_ref()
-                    .key
-                    .as_ref()
-                    .ok_or_else(|| proto_error("Protobuf deserialization error: Dictionary message missing required field 'key'"))?;
-                let pb_value_datatype = dict
-                    .as_ref()
-                    .value
-                    .as_ref()
-                    .ok_or_else(|| proto_error("Protobuf deserialization error: Dictionary message missing required field 'key'"))?;
-                let key_datatype: DataType = pb_key_datatype.as_ref().try_into()?;
-                let value_datatype: DataType = pb_value_datatype.as_ref().try_into()?;
-                DataType::Dictionary(Box::new(key_datatype), Box::new(value_datatype))
-            }
-        })
-    }
-}
-
-#[allow(clippy::from_over_into)]
-impl Into<arrow::datatypes::DataType> for protobuf::PrimitiveScalarType {
-    fn into(self) -> arrow::datatypes::DataType {
-        use arrow::datatypes::DataType;
-        match self {
-            protobuf::PrimitiveScalarType::Bool => DataType::Boolean,
-            protobuf::PrimitiveScalarType::Uint8 => DataType::UInt8,
-            protobuf::PrimitiveScalarType::Int8 => DataType::Int8,
-            protobuf::PrimitiveScalarType::Uint16 => DataType::UInt16,
-            protobuf::PrimitiveScalarType::Int16 => DataType::Int16,
-            protobuf::PrimitiveScalarType::Uint32 => DataType::UInt32,
-            protobuf::PrimitiveScalarType::Int32 => DataType::Int32,
-            protobuf::PrimitiveScalarType::Uint64 => DataType::UInt64,
-            protobuf::PrimitiveScalarType::Int64 => DataType::Int64,
-            protobuf::PrimitiveScalarType::Float32 => DataType::Float32,
-            protobuf::PrimitiveScalarType::Float64 => DataType::Float64,
-            protobuf::PrimitiveScalarType::Utf8 => DataType::Utf8,
-            protobuf::PrimitiveScalarType::LargeUtf8 => DataType::LargeUtf8,
-            protobuf::PrimitiveScalarType::Date32 => DataType::Date32,
-            protobuf::PrimitiveScalarType::TimeMicrosecond => {
-                DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)
-            }
-            protobuf::PrimitiveScalarType::TimeNanosecond => {
-                DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond)
-            }
-            protobuf::PrimitiveScalarType::Null => DataType::Null,
-        }
     }
 }
 
@@ -618,7 +640,7 @@ impl TryInto<datafusion::scalar::ScalarValue> for &protobuf::scalar_value::Value
             }
             protobuf::scalar_value::Value::ListValue(v) => v.try_into()?,
             protobuf::scalar_value::Value::NullListValue(v) => {
-                ScalarValue::List(None, v.try_into()?)
+                ScalarValue::List(None, Box::new(v.try_into()?))
             }
             protobuf::scalar_value::Value::NullValue(null_enum) => {
                 PrimitiveScalarType::from_i32(*null_enum)
@@ -662,8 +684,8 @@ impl TryInto<datafusion::scalar::ScalarValue> for &protobuf::ScalarListValue {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 datafusion::scalar::ScalarValue::List(
-                    Some(typechecked_values),
-                    leaf_scalar_type.into(),
+                    Some(Box::new(typechecked_values)),
+                    Box::new(leaf_scalar_type.into()),
                 )
             }
             Datatype::List(list_type) => {
@@ -707,9 +729,9 @@ impl TryInto<datafusion::scalar::ScalarValue> for &protobuf::ScalarListValue {
                 datafusion::scalar::ScalarValue::List(
                     match typechecked_values.len() {
                         0 => None,
-                        _ => Some(typechecked_values),
+                        _ => Some(Box::new(typechecked_values)),
                     },
-                    list_type.try_into()?,
+                    Box::new(list_type.try_into()?),
                 )
             }
         };
@@ -717,9 +739,9 @@ impl TryInto<datafusion::scalar::ScalarValue> for &protobuf::ScalarListValue {
     }
 }
 
-impl TryInto<arrow::datatypes::DataType> for &protobuf::ScalarListType {
+impl TryInto<DataType> for &protobuf::ScalarListType {
     type Error = BallistaError;
-    fn try_into(self) -> Result<arrow::datatypes::DataType, Self::Error> {
+    fn try_into(self) -> Result<DataType, Self::Error> {
         use protobuf::PrimitiveScalarType;
         let protobuf::ScalarListType {
             deepest_type,
@@ -733,7 +755,7 @@ impl TryInto<arrow::datatypes::DataType> for &protobuf::ScalarListType {
             ));
         }
 
-        let mut curr_type = arrow::datatypes::DataType::List(Box::new(Field::new(
+        let mut curr_type = DataType::List(Box::new(Field::new(
             //Since checked vector is not empty above this is safe to unwrap
             field_names.last().unwrap(),
             PrimitiveScalarType::from_i32(*deepest_type)
@@ -745,9 +767,8 @@ impl TryInto<arrow::datatypes::DataType> for &protobuf::ScalarListType {
         )));
         //Iterates over field names in reverse order except for the last item in the vector
         for name in field_names.iter().rev().skip(1) {
-            let temp_curr_type = arrow::datatypes::DataType::List(Box::new(Field::new(
-                name, curr_type, true,
-            )));
+            let temp_curr_type =
+                DataType::List(Box::new(Field::new(name, curr_type, true)));
             curr_type = temp_curr_type;
         }
         Ok(curr_type)
@@ -847,16 +868,17 @@ impl TryInto<datafusion::scalar::ScalarValue> for &protobuf::ScalarValue {
                     .iter()
                     .map(|val| val.try_into())
                     .collect::<Result<Vec<_>, _>>()?;
-                let scalar_type: arrow::datatypes::DataType =
-                    pb_scalar_type.try_into()?;
-                ScalarValue::List(Some(typechecked_values), scalar_type)
+                let scalar_type: DataType = pb_scalar_type.try_into()?;
+                let scalar_type = Box::new(scalar_type);
+                ScalarValue::List(Some(Box::new(typechecked_values)), scalar_type)
             }
             protobuf::scalar_value::Value::NullListValue(v) => {
                 let pb_datatype = v
                     .datatype
                     .as_ref()
                     .ok_or_else(|| proto_error("Protobuf deserialization error: NullListValue message missing required field 'datatyp'"))?;
-                ScalarValue::List(None, pb_datatype.try_into()?)
+                let pb_datatype = Box::new(pb_datatype.try_into()?);
+                ScalarValue::List(None, pb_datatype)
             }
             protobuf::scalar_value::Value::NullValue(v) => {
                 let null_type_enum = protobuf::PrimitiveScalarType::from_i32(*v)
@@ -871,7 +893,10 @@ impl TryInto<Expr> for &protobuf::LogicalExprNode {
     type Error = BallistaError;
 
     fn try_into(self) -> Result<Expr, Self::Error> {
+        use datafusion::physical_plan::window_functions;
         use protobuf::logical_expr_node::ExprType;
+        use protobuf::window_expr_node;
+        use protobuf::WindowExprNode;
 
         let expr_type = self
             .expr_type
@@ -883,11 +908,86 @@ impl TryInto<Expr> for &protobuf::LogicalExprNode {
                 op: from_proto_binary_op(&binary_expr.op)?,
                 right: Box::new(parse_required_expr(&binary_expr.r)?),
             }),
-            ExprType::ColumnName(column_name) => Ok(Expr::Column(column_name.to_owned())),
+            ExprType::Column(column) => Ok(Expr::Column(column.into())),
             ExprType::Literal(literal) => {
                 use datafusion::scalar::ScalarValue;
                 let scalar_value: datafusion::scalar::ScalarValue = literal.try_into()?;
                 Ok(Expr::Literal(scalar_value))
+            }
+            ExprType::WindowExpr(expr) => {
+                let window_function = expr
+                    .window_function
+                    .as_ref()
+                    .ok_or_else(|| proto_error("Received empty window function"))?;
+                let partition_by = expr
+                    .partition_by
+                    .iter()
+                    .map(|e| e.try_into())
+                    .collect::<Result<Vec<_>, _>>()?;
+                let order_by = expr
+                    .order_by
+                    .iter()
+                    .map(|e| e.try_into())
+                    .collect::<Result<Vec<_>, _>>()?;
+                let window_frame = expr
+                    .window_frame
+                    .as_ref()
+                    .map::<Result<WindowFrame, _>, _>(|e| match e {
+                        window_expr_node::WindowFrame::Frame(frame) => {
+                            let window_frame: WindowFrame = frame.clone().try_into()?;
+                            if WindowFrameUnits::Range == window_frame.units
+                                && order_by.len() != 1
+                            {
+                                Err(proto_error("With window frame of type RANGE, the order by expression must be of length 1"))
+                            } else {
+                                Ok(window_frame)
+                            }
+                        }
+                    })
+                    .transpose()?;
+
+                match window_function {
+                    window_expr_node::WindowFunction::AggrFunction(i) => {
+                        let aggr_function = protobuf::AggregateFunction::from_i32(*i)
+                            .ok_or_else(|| {
+                                proto_error(format!(
+                                    "Received an unknown aggregate window function: {}",
+                                    i
+                                ))
+                            })?;
+
+                        Ok(Expr::WindowFunction {
+                            fun: window_functions::WindowFunction::AggregateFunction(
+                                AggregateFunction::from(aggr_function),
+                            ),
+                            args: vec![parse_required_expr(&expr.expr)?],
+                            partition_by,
+                            order_by,
+                            window_frame,
+                        })
+                    }
+                    window_expr_node::WindowFunction::BuiltInFunction(i) => {
+                        let built_in_function =
+                            protobuf::BuiltInWindowFunction::from_i32(*i).ok_or_else(
+                                || {
+                                    proto_error(format!(
+                                        "Received an unknown built-in window function: {}",
+                                        i
+                                    ))
+                                },
+                            )?;
+
+                        Ok(Expr::WindowFunction {
+                            fun: window_functions::WindowFunction::BuiltInWindowFunction(
+                                BuiltInWindowFunction::from(built_in_function),
+                            ),
+                            args: vec![parse_required_expr(&expr.expr)?],
+                            partition_by,
+                            order_by,
+                            window_frame,
+                        })
+                    }
+                }
             }
             ExprType::AggregateExpr(expr) => {
                 let aggr_function =
@@ -898,13 +998,7 @@ impl TryInto<Expr> for &protobuf::LogicalExprNode {
                                 expr.aggr_function
                             ))
                         })?;
-                let fun = match aggr_function {
-                    protobuf::AggregateFunction::Min => AggregateFunction::Min,
-                    protobuf::AggregateFunction::Max => AggregateFunction::Max,
-                    protobuf::AggregateFunction::Sum => AggregateFunction::Sum,
-                    protobuf::AggregateFunction::Avg => AggregateFunction::Avg,
-                    protobuf::AggregateFunction::Count => AggregateFunction::Count,
-                };
+                let fun = AggregateFunction::from(aggr_function);
 
                 Ok(Expr::AggregateFunction {
                     fun,
@@ -998,77 +1092,58 @@ impl TryInto<Expr> for &protobuf::LogicalExprNode {
                             expr.fun
                         ))
                     })?;
+                let args = &expr.args;
+
                 match scalar_function {
-                    protobuf::ScalarFunction::Sqrt => {
-                        Ok(sqrt((&expr.expr[0]).try_into()?))
-                    }
-                    protobuf::ScalarFunction::Sin => Ok(sin((&expr.expr[0]).try_into()?)),
-                    protobuf::ScalarFunction::Cos => Ok(cos((&expr.expr[0]).try_into()?)),
-                    protobuf::ScalarFunction::Tan => Ok(tan((&expr.expr[0]).try_into()?)),
-                    // protobuf::ScalarFunction::Asin => Ok(asin(&expr.expr[0]).try_into()?)),
-                    // protobuf::ScalarFunction::Acos => Ok(acos(&expr.expr[0]).try_into()?)),
-                    protobuf::ScalarFunction::Atan => {
-                        Ok(atan((&expr.expr[0]).try_into()?))
-                    }
-                    protobuf::ScalarFunction::Exp => Ok(exp((&expr.expr[0]).try_into()?)),
-                    protobuf::ScalarFunction::Log2 => {
-                        Ok(log2((&expr.expr[0]).try_into()?))
-                    }
-                    protobuf::ScalarFunction::Ln => Ok(ln((&expr.expr[0]).try_into()?)),
-                    protobuf::ScalarFunction::Log10 => {
-                        Ok(log10((&expr.expr[0]).try_into()?))
-                    }
-                    protobuf::ScalarFunction::Floor => {
-                        Ok(floor((&expr.expr[0]).try_into()?))
-                    }
-                    protobuf::ScalarFunction::Ceil => {
-                        Ok(ceil((&expr.expr[0]).try_into()?))
-                    }
-                    protobuf::ScalarFunction::Round => {
-                        Ok(round((&expr.expr[0]).try_into()?))
-                    }
-                    protobuf::ScalarFunction::Trunc => {
-                        Ok(trunc((&expr.expr[0]).try_into()?))
-                    }
-                    protobuf::ScalarFunction::Abs => Ok(abs((&expr.expr[0]).try_into()?)),
+                    protobuf::ScalarFunction::Sqrt => Ok(sqrt((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Sin => Ok(sin((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Cos => Ok(cos((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Tan => Ok(tan((&args[0]).try_into()?)),
+                    // protobuf::ScalarFunction::Asin => Ok(asin(&args[0]).try_into()?)),
+                    // protobuf::ScalarFunction::Acos => Ok(acos(&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Atan => Ok(atan((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Exp => Ok(exp((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Log2 => Ok(log2((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Ln => Ok(ln((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Log10 => Ok(log10((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Floor => Ok(floor((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Ceil => Ok(ceil((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Round => Ok(round((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Trunc => Ok(trunc((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Abs => Ok(abs((&args[0]).try_into()?)),
                     protobuf::ScalarFunction::Signum => {
-                        Ok(signum((&expr.expr[0]).try_into()?))
+                        Ok(signum((&args[0]).try_into()?))
                     }
                     protobuf::ScalarFunction::Octetlength => {
-                        Ok(length((&expr.expr[0]).try_into()?))
+                        Ok(length((&args[0]).try_into()?))
                     }
-                    // // protobuf::ScalarFunction::Concat => Ok(concat((&expr.expr[0]).try_into()?)),
-                    protobuf::ScalarFunction::Lower => {
-                        Ok(lower((&expr.expr[0]).try_into()?))
+                    // // protobuf::ScalarFunction::Concat => Ok(concat((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Lower => Ok(lower((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Upper => Ok(upper((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Trim => Ok(trim((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Ltrim => Ok(ltrim((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Rtrim => Ok(rtrim((&args[0]).try_into()?)),
+                    // protobuf::ScalarFunction::Totimestamp => Ok(to_timestamp((&args[0]).try_into()?)),
+                    // protobuf::ScalarFunction::Array => Ok(array((&args[0]).try_into()?)),
+                    // // protobuf::ScalarFunction::Nullif => Ok(nulli((&args[0]).try_into()?)),
+                    protobuf::ScalarFunction::Datepart => {
+                        Ok(date_part((&args[0]).try_into()?, (&args[1]).try_into()?))
                     }
-                    protobuf::ScalarFunction::Upper => {
-                        Ok(upper((&expr.expr[0]).try_into()?))
+                    protobuf::ScalarFunction::Datetrunc => {
+                        Ok(date_trunc((&args[0]).try_into()?, (&args[1]).try_into()?))
                     }
-                    protobuf::ScalarFunction::Trim => {
-                        Ok(trim((&expr.expr[0]).try_into()?))
-                    }
-                    protobuf::ScalarFunction::Ltrim => {
-                        Ok(ltrim((&expr.expr[0]).try_into()?))
-                    }
-                    protobuf::ScalarFunction::Rtrim => {
-                        Ok(rtrim((&expr.expr[0]).try_into()?))
-                    }
-                    // protobuf::ScalarFunction::Totimestamp => Ok(to_timestamp((&expr.expr[0]).try_into()?)),
-                    // protobuf::ScalarFunction::Array => Ok(array((&expr.expr[0]).try_into()?)),
-                    // // protobuf::ScalarFunction::Nullif => Ok(nulli((&expr.expr[0]).try_into()?)),
-                    // protobuf::ScalarFunction::Datetrunc => Ok(date_trunc((&expr.expr[0]).try_into()?)),
-                    // protobuf::ScalarFunction::Md5 => Ok(md5((&expr.expr[0]).try_into()?)),
+                    // protobuf::ScalarFunction::Md5 => Ok(md5((&args[0]).try_into()?)),
                     protobuf::ScalarFunction::Sha224 => {
-                        Ok(sha224((&expr.expr[0]).try_into()?))
+                        Ok(sha224((&args[0]).try_into()?))
                     }
                     protobuf::ScalarFunction::Sha256 => {
-                        Ok(sha256((&expr.expr[0]).try_into()?))
+                        Ok(sha256((&args[0]).try_into()?))
                     }
                     protobuf::ScalarFunction::Sha384 => {
-                        Ok(sha384((&expr.expr[0]).try_into()?))
+                        Ok(sha384((&args[0]).try_into()?))
                     }
                     protobuf::ScalarFunction::Sha512 => {
-                        Ok(sha512((&expr.expr[0]).try_into()?))
+                        Ok(sha512((&args[0]).try_into()?))
                     }
                     _ => Err(proto_error(
                         "Protobuf deserialization error: Unsupported scalar function",
@@ -1079,31 +1154,9 @@ impl TryInto<Expr> for &protobuf::LogicalExprNode {
     }
 }
 
-fn from_proto_binary_op(op: &str) -> Result<Operator, BallistaError> {
-    match op {
-        "And" => Ok(Operator::And),
-        "Or" => Ok(Operator::Or),
-        "Eq" => Ok(Operator::Eq),
-        "NotEq" => Ok(Operator::NotEq),
-        "LtEq" => Ok(Operator::LtEq),
-        "Lt" => Ok(Operator::Lt),
-        "Gt" => Ok(Operator::Gt),
-        "GtEq" => Ok(Operator::GtEq),
-        "Plus" => Ok(Operator::Plus),
-        "Minus" => Ok(Operator::Minus),
-        "Multiply" => Ok(Operator::Multiply),
-        "Divide" => Ok(Operator::Divide),
-        "Like" => Ok(Operator::Like),
-        other => Err(proto_error(format!(
-            "Unsupported binary operator '{:?}'",
-            other
-        ))),
-    }
-}
-
-impl TryInto<arrow::datatypes::DataType> for &protobuf::ScalarType {
+impl TryInto<DataType> for &protobuf::ScalarType {
     type Error = BallistaError;
-    fn try_into(self) -> Result<arrow::datatypes::DataType, Self::Error> {
+    fn try_into(self) -> Result<DataType, Self::Error> {
         let pb_scalartype = self.datatype.as_ref().ok_or_else(|| {
             proto_error("ScalarType message missing required field 'datatype'")
         })?;
@@ -1134,16 +1187,16 @@ impl TryInto<Schema> for &protobuf::Schema {
     }
 }
 
-impl TryInto<arrow::datatypes::Field> for &protobuf::Field {
+impl TryInto<Field> for &protobuf::Field {
     type Error = BallistaError;
-    fn try_into(self) -> Result<arrow::datatypes::Field, Self::Error> {
+    fn try_into(self) -> Result<Field, Self::Error> {
         let pb_datatype = self.arrow_type.as_ref().ok_or_else(|| {
             proto_error(
                 "Protobuf deserialization error: Field message missing required field 'arrow_type'",
             )
         })?;
 
-        Ok(arrow::datatypes::Field::new(
+        Ok(Field::new(
             self.name.as_str(),
             pb_datatype.as_ref().try_into()?,
             self.nullable,
@@ -1151,9 +1204,11 @@ impl TryInto<arrow::datatypes::Field> for &protobuf::Field {
     }
 }
 
-use datafusion::physical_plan::datetime_expressions::{date_trunc, to_timestamp};
+use crate::serde::protobuf::ColumnStats;
+use datafusion::physical_plan::{aggregates, windows, ColumnStatistics, Statistics};
 use datafusion::prelude::{
-    array, length, lower, ltrim, md5, rtrim, sha224, sha256, sha384, sha512, trim, upper,
+    array, date_part, date_trunc, length, lower, ltrim, md5, rtrim, sha224, sha256,
+    sha384, sha512, trim, upper,
 };
 use std::convert::TryFrom;
 
@@ -1165,6 +1220,7 @@ impl TryFrom<i32> for protobuf::FileType {
             _x if _x == FileType::NdJson as i32 => Ok(FileType::NdJson),
             _x if _x == FileType::Parquet as i32 => Ok(FileType::Parquet),
             _x if _x == FileType::Csv as i32 => Ok(FileType::Csv),
+            _x if _x == FileType::Avro as i32 => Ok(FileType::Avro),
             invalid => Err(BallistaError::General(format!(
                 "Attempted to convert invalid i32 to protobuf::Filetype: {}",
                 invalid
@@ -1181,6 +1237,7 @@ impl Into<datafusion::sql::parser::FileType> for protobuf::FileType {
             protobuf::FileType::NdJson => FileType::NdJson,
             protobuf::FileType::Parquet => FileType::Parquet,
             protobuf::FileType::Csv => FileType::CSV,
+            protobuf::FileType::Avro => FileType::Avro,
         }
     }
 }
@@ -1200,5 +1257,80 @@ fn parse_optional_expr(
     match p {
         Some(expr) => expr.as_ref().try_into().map(Some),
         None => Ok(None),
+    }
+}
+
+impl From<protobuf::WindowFrameUnits> for WindowFrameUnits {
+    fn from(units: protobuf::WindowFrameUnits) -> Self {
+        match units {
+            protobuf::WindowFrameUnits::Rows => WindowFrameUnits::Rows,
+            protobuf::WindowFrameUnits::Range => WindowFrameUnits::Range,
+            protobuf::WindowFrameUnits::Groups => WindowFrameUnits::Groups,
+        }
+    }
+}
+
+impl TryFrom<protobuf::WindowFrameBound> for WindowFrameBound {
+    type Error = BallistaError;
+
+    fn try_from(bound: protobuf::WindowFrameBound) -> Result<Self, Self::Error> {
+        let bound_type = protobuf::WindowFrameBoundType::from_i32(bound.window_frame_bound_type).ok_or_else(|| {
+            proto_error(format!(
+                "Received a WindowFrameBound message with unknown WindowFrameBoundType {}",
+                bound.window_frame_bound_type
+            ))
+        })?;
+        match bound_type {
+            protobuf::WindowFrameBoundType::CurrentRow => {
+                Ok(WindowFrameBound::CurrentRow)
+            }
+            protobuf::WindowFrameBoundType::Preceding => {
+                // FIXME implement bound value parsing
+                // https://github.com/apache/arrow-datafusion/issues/361
+                Ok(WindowFrameBound::Preceding(Some(1)))
+            }
+            protobuf::WindowFrameBoundType::Following => {
+                // FIXME implement bound value parsing
+                // https://github.com/apache/arrow-datafusion/issues/361
+                Ok(WindowFrameBound::Following(Some(1)))
+            }
+        }
+    }
+}
+
+impl TryFrom<protobuf::WindowFrame> for WindowFrame {
+    type Error = BallistaError;
+
+    fn try_from(window: protobuf::WindowFrame) -> Result<Self, Self::Error> {
+        let units = protobuf::WindowFrameUnits::from_i32(window.window_frame_units)
+            .ok_or_else(|| {
+                proto_error(format!(
+                    "Received a WindowFrame message with unknown WindowFrameUnits {}",
+                    window.window_frame_units
+                ))
+            })?
+            .into();
+        let start_bound = window
+            .start_bound
+            .ok_or_else(|| {
+                proto_error(
+                    "Received a WindowFrame message with no start_bound".to_owned(),
+                )
+            })?
+            .try_into()?;
+        let end_bound = window
+            .end_bound
+            .map(|end_bound| match end_bound {
+                protobuf::window_frame::EndBound::Bound(end_bound) => {
+                    end_bound.try_into()
+                }
+            })
+            .transpose()?
+            .unwrap_or(WindowFrameBound::CurrentRow);
+        Ok(WindowFrame {
+            units,
+            start_bound,
+            end_bound,
+        })
     }
 }

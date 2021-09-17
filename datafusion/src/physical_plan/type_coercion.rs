@@ -60,7 +60,7 @@ pub fn coerce(
     expressions
         .iter()
         .enumerate()
-        .map(|(i, expr)| try_cast(expr.clone(), &schema, new_types[i].clone()))
+        .map(|(i, expr)| try_cast(expr.clone(), schema, new_types[i].clone()))
         .collect::<Result<Vec<_>>>()
 }
 
@@ -85,7 +85,7 @@ pub fn data_types(
     }
 
     for valid_types in valid_types {
-        if let Some(types) = maybe_data_types(&valid_types, &current_types) {
+        if let Some(types) = maybe_data_types(&valid_types, current_types) {
             return Ok(types);
         }
     }
@@ -128,13 +128,11 @@ fn get_valid_types(
             }
             vec![(0..*number).map(|i| current_types[i].clone()).collect()]
         }
-        Signature::OneOf(types) => {
-            let mut r = vec![];
-            for s in types {
-                r.extend(get_valid_types(s, current_types)?);
-            }
-            r
-        }
+        Signature::OneOf(types) => types
+            .iter()
+            .filter_map(|t| get_valid_types(t, current_types).ok())
+            .flatten()
+            .collect::<Vec<_>>(),
     };
 
     Ok(valid_types)
@@ -157,7 +155,7 @@ fn maybe_data_types(
             new_type.push(current_type.clone())
         } else {
             // attempt to coerce
-            if can_coerce_from(valid_type, &current_type) {
+            if can_coerce_from(valid_type, current_type) {
                 new_type.push(valid_type.clone())
             } else {
                 // not possible
@@ -267,7 +265,9 @@ mod tests {
         let expressions = |t: Vec<DataType>, schema| -> Result<Vec<_>> {
             t.iter()
                 .enumerate()
-                .map(|(i, t)| try_cast(col(&format!("c{}", i)), &schema, t.clone()))
+                .map(|(i, t)| {
+                    try_cast(col(&format!("c{}", i), &schema)?, &schema, t.clone())
+                })
                 .collect::<Result<Vec<_>>>()
         };
 
@@ -362,6 +362,29 @@ mod tests {
                 )));
             }
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_valid_types_one_of() -> Result<()> {
+        let signature = Signature::OneOf(vec![Signature::Any(1), Signature::Any(2)]);
+
+        let invalid_types = get_valid_types(
+            &signature,
+            &[DataType::Int32, DataType::Int32, DataType::Int32],
+        )?;
+        assert_eq!(invalid_types.len(), 0);
+
+        let args = vec![DataType::Int32, DataType::Int32];
+        let valid_types = get_valid_types(&signature, &args)?;
+        assert_eq!(valid_types.len(), 1);
+        assert_eq!(valid_types[0], args);
+
+        let args = vec![DataType::Int32];
+        let valid_types = get_valid_types(&signature, &args)?;
+        assert_eq!(valid_types.len(), 1);
+        assert_eq!(valid_types[0], args);
 
         Ok(())
     }

@@ -44,13 +44,13 @@ to the `.gitignore` file.
 The benchmark can then be run (assuming the data created from `dbgen` is in `./data`) with a command such as:
 
 ```bash
-cargo run --release --bin tpch -- benchmark --iterations 3 --path ./data --format tbl --query 1 --batch-size 4096
+cargo run --release --bin tpch -- benchmark datafusion --iterations 3 --path ./data --format tbl --query 1 --batch-size 4096
 ```
 
 You can enable the features `simd` (to use SIMD instructions) and/or `mimalloc` or `snmalloc` (to use either the mimalloc or snmalloc allocator) as features by passing them in as `--features`:
 
 ```
-cargo run --release --features "simd mimalloc" --bin tpch -- benchmark --iterations 3 --path ./data --format tbl --query 1 --batch-size 4096
+cargo run --release --features "simd mimalloc" --bin tpch -- benchmark datafusion --iterations 3 --path ./data --format tbl --query 1 --batch-size 4096
 ```
 
 The benchmark program also supports CSV and Parquet input file formats and a utility is provided to convert from `tbl`
@@ -122,8 +122,8 @@ RUST_LOG=info RUSTFLAGS='-C target-cpu=native -C lto -C codegen-units=1 -C embed
 To run the benchmarks:
 
 ```bash
-cd $ARROW_HOME/ballista/rust/benchmarks/tpch
-cargo run --release benchmark --host localhost --port 50050 --query 1 --path $(pwd)/data --format tbl
+cd $ARROW_HOME/benchmarks
+cargo run --release benchmark ballista --host localhost --port 50050 --query 1 --path $(pwd)/data --format tbl
 ```
 
 ## Running the Ballista Benchmarks on docker-compose
@@ -131,16 +131,16 @@ cargo run --release benchmark --host localhost --port 50050 --query 1 --path $(p
 To start a Rust scheduler and executor using Docker Compose:
 
 ```bash
-cd $BALLISTA_HOME
+cd $ARROW_HOME
 ./dev/build-rust.sh
-cd $BALLISTA_HOME/rust/benchmarks/tpch
+cd $ARROW_HOME/benchmarks
 docker-compose up
 ```
 
 Then you can run the benchmark with:
 
 ```bash
-docker-compose run ballista-client cargo run benchmark --host ballista-scheduler --port 50050 --query 1 --path /data --format tbl
+docker-compose run ballista-client bash -c '/tpch benchmark ballista --host ballista-scheduler --port 50050 --query 1 --path /data --format tbl'
 ```
 
 ## Expected output

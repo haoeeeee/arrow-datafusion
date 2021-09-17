@@ -25,7 +25,7 @@
 //! use datafusion::datasource::TableProvider;
 //! use datafusion::datasource::csv::{CsvFile, CsvReadOptions};
 //!
-//! let testdata = arrow::util::test_util::arrow_test_data();
+//! let testdata = datafusion::test_util::arrow_test_data();
 //! let csvdata = CsvFile::try_new(
 //!     &format!("{}/csv/aggregate_test_100.csv", testdata),
 //!     CsvReadOptions::new().delimiter(b'|'),
@@ -39,21 +39,12 @@ use std::io::{Read, Seek};
 use std::string::String;
 use std::sync::{Arc, Mutex};
 
-use crate::datasource::datasource::Statistics;
-use crate::datasource::TableProvider;
+use crate::datasource::{Source, TableProvider};
 use crate::error::{DataFusionError, Result};
 use crate::logical_plan::Expr;
 use crate::physical_plan::csv::CsvExec;
 pub use crate::physical_plan::csv::CsvReadOptions;
 use crate::physical_plan::{common, ExecutionPlan};
-
-enum Source {
-    /// Path to a single CSV file or a directory containing one of more CSV files
-    Path(String),
-
-    /// Read CSV data from a reader
-    Reader(Mutex<Option<Box<dyn Read + Send + Sync + 'static>>>),
-}
 
 /// Represents a CSV file with a provided schema
 pub struct CsvFile {
@@ -62,16 +53,16 @@ pub struct CsvFile {
     has_header: bool,
     delimiter: u8,
     file_extension: String,
-    statistics: Statistics,
 }
 
 impl CsvFile {
     /// Attempt to initialize a new `CsvFile` from a file path
-    pub fn try_new(path: &str, options: CsvReadOptions) -> Result<Self> {
+    pub fn try_new(path: impl Into<String>, options: CsvReadOptions) -> Result<Self> {
+        let path = path.into();
         let schema = Arc::new(match options.schema {
             Some(s) => s.clone(),
             None => {
-                let filenames = common::build_file_list(path, options.file_extension)?;
+                let filenames = common::build_file_list(&path, options.file_extension)?;
                 if filenames.is_empty() {
                     return Err(DataFusionError::Plan(format!(
                         "No files found at {path} with file extension {file_extension}",
@@ -84,12 +75,11 @@ impl CsvFile {
         });
 
         Ok(Self {
-            source: Source::Path(path.to_string()),
+            source: Source::Path(path),
             schema,
             has_header: options.has_header,
             delimiter: options.delimiter,
             file_extension: String::from(options.file_extension),
-            statistics: Statistics::default(),
         })
     }
 
@@ -112,7 +102,6 @@ impl CsvFile {
             schema,
             has_header: options.has_header,
             delimiter: options.delimiter,
-            statistics: Statistics::default(),
             file_extension: String::new(),
         })
     }
@@ -140,7 +129,6 @@ impl CsvFile {
             schema,
             has_header: options.has_header,
             delimiter: options.delimiter,
-            statistics: Statistics::default(),
             file_extension: String::new(),
         })
     }
@@ -216,14 +204,10 @@ impl TableProvider for CsvFile {
                 }
             }
             Source::Path(p) => {
-                CsvExec::try_new(&p, opts, projection.clone(), batch_size, limit)?
+                CsvExec::try_new(p, opts, projection.clone(), batch_size, limit)?
             }
         };
         Ok(Arc::new(exec))
-    }
-
-    fn statistics(&self) -> Statistics {
-        self.statistics.clone()
     }
 }
 
@@ -234,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn csv_file_from_reader() -> Result<()> {
-        let testdata = arrow::util::test_util::arrow_test_data();
+        let testdata = crate::test_util::arrow_test_data();
         let filename = "aggregate_test_100.csv";
         let path = format!("{}/csv/{}", testdata, filename);
         let buf = std::fs::read(path).unwrap();

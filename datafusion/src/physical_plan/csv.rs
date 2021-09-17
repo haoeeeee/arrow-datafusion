@@ -18,8 +18,9 @@
 //! Execution plan for reading CSV files
 
 use crate::error::{DataFusionError, Result};
-use crate::physical_plan::{common, DisplayFormatType, ExecutionPlan, Partitioning};
 use crate::physical_plan::LambdaExecPlan;
+use crate::physical_plan::ExecutionPlan;
+use crate::physical_plan::{common, source::Source, Partitioning};
 use arrow::csv;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::Result as ArrowResult;
@@ -33,7 +34,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
 
-use super::{RecordBatchStream, SendableRecordBatchStream};
+use super::{
+    DisplayFormatType, RecordBatchStream, SendableRecordBatchStream, Statistics,
+};
 use async_trait::async_trait;
 
 use serde::{Deserialize, Serialize};
@@ -109,83 +112,11 @@ impl<'a> CsvReadOptions<'a> {
     }
 }
 
-///  Source represents where the data comes from.
-#[derive(Serialize, Deserialize)]
-enum Source {
-    /// The data comes from partitioned files
-    PartitionedFiles {
-        /// Path to directory containing partitioned files with the same schema
-        path: String,
-        /// The individual files under path
-        filenames: Vec<String>,
-    },
-
-    /// The data comes from anything impl Read trait
-    #[serde(skip)]
-    Reader(Mutex<Option<Box<dyn Read + Send + Sync + 'static>>>),
-}
-
-impl std::fmt::Debug for Source {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Source::PartitionedFiles { path, filenames } => f
-                .debug_struct("PartitionedFiles")
-                .field("path", path)
-                .field("filenames", filenames)
-                .finish()?,
-            Source::Reader(_) => f.write_str("Reader")?,
-        };
-        Ok(())
-    }
-}
-
-impl std::fmt::Display for Source {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Source::PartitionedFiles { path, filenames } => {
-                write!(f, "Path({}: [{}])", path, filenames.join(","))
-            }
-            Source::Reader(_) => {
-                write!(f, "Reader(...)")
-            }
-        }
-    }
-}
-
-impl Clone for Source {
-    fn clone(&self) -> Self {
-        match self {
-            Source::PartitionedFiles { path, filenames } => Self::PartitionedFiles {
-                path: path.clone(),
-                filenames: filenames.clone(),
-            },
-            Source::Reader(_) => Self::Reader(Mutex::new(None)),
-        }
-    }
-}
-
-impl Source {
-    /// Path to directory containing partitioned files with the same schema
-    pub fn path(&self) -> &str {
-        match self {
-            Source::PartitionedFiles { path, .. } => path.as_str(),
-            Source::Reader(_) => "",
-        }
-    }
-
-    /// The individual files under path
-    pub fn filenames(&self) -> &[String] {
-        match self {
-            Source::PartitionedFiles { filenames, .. } => filenames,
-            Source::Reader(_) => &[],
-        }
-    }
-}
-
 /// Execution plan for scanning a CSV file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CsvExec {
     /// Where the data comes from.
+    #[serde(skip)]
     source: Source,
     /// Schema representing the CSV file
     schema: SchemaRef,
@@ -443,6 +374,11 @@ impl ExecutionPlan for CsvExec {
             }
         }
     }
+
+    fn statistics(&self) -> Statistics {
+        // TODO stats: handle statistics
+        Statistics::default()
+    }
 }
 
 #[async_trait]
@@ -529,7 +465,7 @@ mod tests {
     #[tokio::test]
     async fn csv_exec_with_projection() -> Result<()> {
         let schema = aggr_test_schema();
-        let testdata = arrow::util::test_util::arrow_test_data();
+        let testdata = crate::test_util::arrow_test_data();
         let filename = "aggregate_test_100.csv";
         let path = format!("{}/csv/{}", testdata, filename);
         let csv = CsvExec::try_new(
@@ -557,7 +493,7 @@ mod tests {
     #[tokio::test]
     async fn csv_exec_without_projection() -> Result<()> {
         let schema = aggr_test_schema();
-        let testdata = arrow::util::test_util::arrow_test_data();
+        let testdata = crate::test_util::arrow_test_data();
         let filename = "aggregate_test_100.csv";
         let path = format!("{}/csv/{}", testdata, filename);
         let csv = CsvExec::try_new(
@@ -585,7 +521,7 @@ mod tests {
     #[tokio::test]
     async fn csv_exec_with_reader() -> Result<()> {
         let schema = aggr_test_schema();
-        let testdata = arrow::util::test_util::arrow_test_data();
+        let testdata = crate::test_util::arrow_test_data();
         let filename = "aggregate_test_100.csv";
         let path = format!("{}/csv/{}", testdata, filename);
         let buf = std::fs::read(path).unwrap();

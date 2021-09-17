@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use arrow::compute::kernels::cast_utils::string_to_timestamp_nanos;
 use arrow::datatypes::DataType;
 
 use crate::error::Result;
@@ -29,6 +30,7 @@ use crate::optimizer::optimizer::OptimizerRule;
 use crate::optimizer::utils;
 use crate::physical_plan::functions::BuiltinScalarFunction;
 use crate::scalar::ScalarValue;
+use arrow::compute::{kernels, DEFAULT_CAST_OPTIONS};
 
 /// Optimizer that simplifies comparison expressions involving boolean literals.
 ///
@@ -71,12 +73,14 @@ impl OptimizerRule for ConstantFolding {
             }),
             // Rest: recurse into plan, apply optimization where possible
             LogicalPlan::Projection { .. }
+            | LogicalPlan::Window { .. }
             | LogicalPlan::Aggregate { .. }
             | LogicalPlan::Repartition { .. }
             | LogicalPlan::CreateExternalTable { .. }
             | LogicalPlan::Extension { .. }
             | LogicalPlan::Sort { .. }
             | LogicalPlan::Explain { .. }
+            | LogicalPlan::Analyze { .. }
             | LogicalPlan::Limit { .. }
             | LogicalPlan::Union { .. }
             | LogicalPlan::Join { .. }
@@ -216,6 +220,54 @@ impl<'a> ExprRewriter for ConstantRewriter<'a> {
                     .query_execution_start_time
                     .timestamp_nanos(),
             ))),
+            Expr::ScalarFunction {
+                fun: BuiltinScalarFunction::ToTimestamp,
+                args,
+            } => {
+                if !args.is_empty() {
+                    match &args[0] {
+                        Expr::Literal(ScalarValue::Utf8(Some(val))) => {
+                            match string_to_timestamp_nanos(val) {
+                                Ok(timestamp) => Expr::Literal(
+                                    ScalarValue::TimestampNanosecond(Some(timestamp)),
+                                ),
+                                _ => Expr::ScalarFunction {
+                                    fun: BuiltinScalarFunction::ToTimestamp,
+                                    args,
+                                },
+                            }
+                        }
+                        _ => Expr::ScalarFunction {
+                            fun: BuiltinScalarFunction::ToTimestamp,
+                            args,
+                        },
+                    }
+                } else {
+                    Expr::ScalarFunction {
+                        fun: BuiltinScalarFunction::ToTimestamp,
+                        args,
+                    }
+                }
+            }
+            Expr::Cast {
+                expr: inner,
+                data_type,
+            } => match inner.as_ref() {
+                Expr::Literal(val) => {
+                    let scalar_array = val.to_array();
+                    let cast_array = kernels::cast::cast_with_options(
+                        &scalar_array,
+                        &data_type,
+                        &DEFAULT_CAST_OPTIONS,
+                    )?;
+                    let cast_scalar = ScalarValue::try_from_array(&cast_array, 0)?;
+                    Expr::Literal(cast_scalar)
+                }
+                _ => Expr::Cast {
+                    expr: inner,
+                    data_type,
+                },
+            },
             expr => {
                 // no rewrite possible
                 expr
@@ -242,7 +294,7 @@ mod tests {
             Field::new("c", DataType::Boolean, false),
             Field::new("d", DataType::UInt32, false),
         ]);
-        LogicalPlanBuilder::scan_empty("test", &schema, None)?.build()
+        LogicalPlanBuilder::scan_empty(Some("test"), &schema, None)?.build()
     }
 
     fn expr_test_schema() -> DFSchemaRef {
@@ -493,16 +545,16 @@ mod tests {
     #[test]
     fn optimize_plan_eq_expr() -> Result<()> {
         let table_scan = test_table_scan()?;
-        let plan = LogicalPlanBuilder::from(&table_scan)
+        let plan = LogicalPlanBuilder::from(table_scan)
             .filter(col("b").eq(lit(true)))?
             .filter(col("c").eq(lit(false)))?
             .project(vec![col("a")])?
             .build()?;
 
         let expected = "\
-        Projection: #a\
-        \n  Filter: NOT #c\
-        \n    Filter: #b\
+        Projection: #test.a\
+        \n  Filter: NOT #test.c\
+        \n    Filter: #test.b\
         \n      TableScan: test projection=None";
 
         assert_optimized_plan_eq(&plan, expected);
@@ -512,7 +564,7 @@ mod tests {
     #[test]
     fn optimize_plan_not_eq_expr() -> Result<()> {
         let table_scan = test_table_scan()?;
-        let plan = LogicalPlanBuilder::from(&table_scan)
+        let plan = LogicalPlanBuilder::from(table_scan)
             .filter(col("b").not_eq(lit(true)))?
             .filter(col("c").not_eq(lit(false)))?
             .limit(1)?
@@ -520,10 +572,10 @@ mod tests {
             .build()?;
 
         let expected = "\
-        Projection: #a\
+        Projection: #test.a\
         \n  Limit: 1\
-        \n    Filter: #c\
-        \n      Filter: NOT #b\
+        \n    Filter: #test.c\
+        \n      Filter: NOT #test.b\
         \n        TableScan: test projection=None";
 
         assert_optimized_plan_eq(&plan, expected);
@@ -533,14 +585,14 @@ mod tests {
     #[test]
     fn optimize_plan_and_expr() -> Result<()> {
         let table_scan = test_table_scan()?;
-        let plan = LogicalPlanBuilder::from(&table_scan)
+        let plan = LogicalPlanBuilder::from(table_scan)
             .filter(col("b").not_eq(lit(true)).and(col("c").eq(lit(true))))?
             .project(vec![col("a")])?
             .build()?;
 
         let expected = "\
-        Projection: #a\
-        \n  Filter: NOT #b And #c\
+        Projection: #test.a\
+        \n  Filter: NOT #test.b And #test.c\
         \n    TableScan: test projection=None";
 
         assert_optimized_plan_eq(&plan, expected);
@@ -550,14 +602,14 @@ mod tests {
     #[test]
     fn optimize_plan_or_expr() -> Result<()> {
         let table_scan = test_table_scan()?;
-        let plan = LogicalPlanBuilder::from(&table_scan)
+        let plan = LogicalPlanBuilder::from(table_scan)
             .filter(col("b").not_eq(lit(true)).or(col("c").eq(lit(false))))?
             .project(vec![col("a")])?
             .build()?;
 
         let expected = "\
-        Projection: #a\
-        \n  Filter: NOT #b Or NOT #c\
+        Projection: #test.a\
+        \n  Filter: NOT #test.b Or NOT #test.c\
         \n    TableScan: test projection=None";
 
         assert_optimized_plan_eq(&plan, expected);
@@ -567,14 +619,14 @@ mod tests {
     #[test]
     fn optimize_plan_not_expr() -> Result<()> {
         let table_scan = test_table_scan()?;
-        let plan = LogicalPlanBuilder::from(&table_scan)
+        let plan = LogicalPlanBuilder::from(table_scan)
             .filter(col("b").eq(lit(false)).not())?
             .project(vec![col("a")])?
             .build()?;
 
         let expected = "\
-        Projection: #a\
-        \n  Filter: #b\
+        Projection: #test.a\
+        \n  Filter: #test.b\
         \n    TableScan: test projection=None";
 
         assert_optimized_plan_eq(&plan, expected);
@@ -584,12 +636,12 @@ mod tests {
     #[test]
     fn optimize_plan_support_projection() -> Result<()> {
         let table_scan = test_table_scan()?;
-        let plan = LogicalPlanBuilder::from(&table_scan)
+        let plan = LogicalPlanBuilder::from(table_scan)
             .project(vec![col("a"), col("d"), col("b").eq(lit(false))])?
             .build()?;
 
         let expected = "\
-        Projection: #a, #d, NOT #b\
+        Projection: #test.a, #test.d, NOT #test.b\
         \n  TableScan: test projection=None";
 
         assert_optimized_plan_eq(&plan, expected);
@@ -599,7 +651,7 @@ mod tests {
     #[test]
     fn optimize_plan_support_aggregate() -> Result<()> {
         let table_scan = test_table_scan()?;
-        let plan = LogicalPlanBuilder::from(&table_scan)
+        let plan = LogicalPlanBuilder::from(table_scan)
             .project(vec![col("a"), col("c"), col("b")])?
             .aggregate(
                 vec![col("a"), col("c")],
@@ -608,8 +660,8 @@ mod tests {
             .build()?;
 
         let expected = "\
-        Aggregate: groupBy=[[#a, #c]], aggr=[[MAX(#b), MIN(#b)]]\
-        \n  Projection: #a, #c, #b\
+        Aggregate: groupBy=[[#test.a, #test.c]], aggr=[[MAX(#test.b), MIN(#test.b)]]\
+        \n  Projection: #test.a, #test.c, #test.b\
         \n    TableScan: test projection=None";
 
         assert_optimized_plan_eq(&plan, expected);
@@ -632,6 +684,106 @@ mod tests {
     }
 
     #[test]
+    fn to_timestamp_expr() {
+        let table_scan = test_table_scan().unwrap();
+        let proj = vec![Expr::ScalarFunction {
+            args: vec![Expr::Literal(ScalarValue::Utf8(Some(
+                "2020-09-08T12:00:00+00:00".to_string(),
+            )))],
+            fun: BuiltinScalarFunction::ToTimestamp,
+        }];
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(proj)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let expected = "Projection: TimestampNanosecond(1599566400000000000)\
+            \n  TableScan: test projection=None"
+            .to_string();
+        let actual = get_optimized_plan_formatted(&plan, &chrono::Utc::now());
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn to_timestamp_expr_wrong_arg() {
+        let table_scan = test_table_scan().unwrap();
+        let proj = vec![Expr::ScalarFunction {
+            args: vec![Expr::Literal(ScalarValue::Utf8(Some(
+                "I'M NOT A TIMESTAMP".to_string(),
+            )))],
+            fun: BuiltinScalarFunction::ToTimestamp,
+        }];
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(proj)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let expected = "Projection: totimestamp(Utf8(\"I\'M NOT A TIMESTAMP\"))\
+            \n  TableScan: test projection=None";
+        let actual = get_optimized_plan_formatted(&plan, &chrono::Utc::now());
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn to_timestamp_expr_no_arg() {
+        let table_scan = test_table_scan().unwrap();
+        let proj = vec![Expr::ScalarFunction {
+            args: vec![],
+            fun: BuiltinScalarFunction::ToTimestamp,
+        }];
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(proj)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let expected = "Projection: totimestamp()\
+            \n  TableScan: test projection=None";
+        let actual = get_optimized_plan_formatted(&plan, &chrono::Utc::now());
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn cast_expr() {
+        let table_scan = test_table_scan().unwrap();
+        let proj = vec![Expr::Cast {
+            expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some("0".to_string())))),
+            data_type: DataType::Int32,
+        }];
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(proj)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let expected = "Projection: Int32(0)\
+            \n  TableScan: test projection=None";
+        let actual = get_optimized_plan_formatted(&plan, &chrono::Utc::now());
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn cast_expr_wrong_arg() {
+        let table_scan = test_table_scan().unwrap();
+        let proj = vec![Expr::Cast {
+            expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some("".to_string())))),
+            data_type: DataType::Int32,
+        }];
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(proj)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let expected = "Projection: Int32(NULL)\
+            \n  TableScan: test projection=None";
+        let actual = get_optimized_plan_formatted(&plan, &chrono::Utc::now());
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
     fn single_now_expr() {
         let table_scan = test_table_scan().unwrap();
         let proj = vec![Expr::ScalarFunction {
@@ -639,7 +791,7 @@ mod tests {
             fun: BuiltinScalarFunction::Now,
         }];
         let time = chrono::Utc::now();
-        let plan = LogicalPlanBuilder::from(&table_scan)
+        let plan = LogicalPlanBuilder::from(table_scan)
             .project(proj)
             .unwrap()
             .build()
@@ -672,7 +824,7 @@ mod tests {
                 "t2".to_string(),
             ),
         ];
-        let plan = LogicalPlanBuilder::from(&table_scan)
+        let plan = LogicalPlanBuilder::from(table_scan)
             .project(proj)
             .unwrap()
             .build()

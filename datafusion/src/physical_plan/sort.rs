@@ -17,35 +17,31 @@
 
 //! Defines the SORT plan
 
-use std::any::Any;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Instant;
-
-use async_trait::async_trait;
-use futures::stream::Stream;
-use futures::Future;
-use hashbrown::HashMap;
-
-use pin_project_lite::pin_project;
-
+use super::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput,
+};
+use super::{RecordBatchStream, SendableRecordBatchStream, Statistics};
+use crate::error::{DataFusionError, Result};
+use crate::physical_plan::expressions::PhysicalSortExpr;
+use crate::physical_plan::{
+    common, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
+};
 pub use arrow::compute::SortOptions;
-use arrow::compute::{concat, lexsort_to_indices, take, SortColumn, TakeOptions};
+use arrow::compute::{lexsort_to_indices, take, SortColumn, TakeOptions};
 use arrow::datatypes::SchemaRef;
 use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
 use arrow::{array::ArrayRef, error::ArrowError};
-
-use super::{RecordBatchStream, SendableRecordBatchStream};
-use crate::error::{DataFusionError, Result};
-use crate::physical_plan::expressions::PhysicalSortExpr;
-use crate::physical_plan::{
-    common, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, SQLMetric,
-};
 use crate::physical_plan::LambdaExecPlan;
-
 use serde::{Deserialize, Serialize};
+use async_trait::async_trait;
+use futures::stream::Stream;
+use futures::Future;
+use pin_project_lite::pin_project;
+use std::any::Any;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 /// Sort execution plan
 #[derive(Debug, Serialize, Deserialize)]
@@ -54,10 +50,10 @@ pub struct SortExec {
     input: Arc<dyn ExecutionPlan>,
     /// Sort expressions
     expr: Vec<PhysicalSortExpr>,
-    /// Output rows
-    output_rows: Arc<SQLMetric>,
-    /// Time to sort batches
-    sort_time_nanos: Arc<SQLMetric>,
+    /// Execution metrics
+    metrics: ExecutionPlanMetricsSet,
+    /// Preserve partitions of input plan
+    preserve_partitioning: bool,
 }
 
 impl SortExec {
@@ -66,12 +62,22 @@ impl SortExec {
         expr: Vec<PhysicalSortExpr>,
         input: Arc<dyn ExecutionPlan>,
     ) -> Result<Self> {
-        Ok(Self {
+        Ok(Self::new_with_partitioning(expr, input, false))
+    }
+
+    /// Create a new sort execution plan with the option to preserve
+    /// the partitioning of the input plan
+    pub fn new_with_partitioning(
+        expr: Vec<PhysicalSortExpr>,
+        input: Arc<dyn ExecutionPlan>,
+        preserve_partitioning: bool,
+    ) -> Self {
+        Self {
             expr,
             input,
-            output_rows: SQLMetric::counter(),
-            sort_time_nanos: SQLMetric::time_nanos(),
-        })
+            metrics: ExecutionPlanMetricsSet::new(),
+            preserve_partitioning,
+        }
     }
 
     /// Input schema
@@ -107,11 +113,19 @@ impl ExecutionPlan for SortExec {
 
     /// Get the output partitioning of this plan
     fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
+        if self.preserve_partitioning {
+            self.input.output_partitioning()
+        } else {
+            Partitioning::UnknownPartitioning(1)
+        }
     }
 
     fn required_child_distribution(&self) -> Distribution {
-        Distribution::SinglePartition
+        if self.preserve_partitioning {
+            Distribution::UnspecifiedDistribution
+        } else {
+            Distribution::SinglePartition
+        }
     }
 
     fn with_new_children(
@@ -130,26 +144,29 @@ impl ExecutionPlan for SortExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream> {
-        if 0 != partition {
-            return Err(DataFusionError::Internal(format!(
-                "SortExec invalid partition {}",
-                partition
-            )));
+        if !self.preserve_partitioning {
+            if 0 != partition {
+                return Err(DataFusionError::Internal(format!(
+                    "SortExec invalid partition {}",
+                    partition
+                )));
+            }
+
+            // sort needs to operate on a single partition currently
+            if 1 != self.input.output_partitioning().partition_count() {
+                return Err(DataFusionError::Internal(
+                    "SortExec requires a single input partition".to_owned(),
+                ));
+            }
         }
 
-        // sort needs to operate on a single partition currently
-        if 1 != self.input.output_partitioning().partition_count() {
-            return Err(DataFusionError::Internal(
-                "SortExec requires a single input partition".to_owned(),
-            ));
-        }
-        let input = self.input.execute(0).await?;
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        let input = self.input.execute(partition).await?;
 
         Ok(Box::pin(SortStream::new(
             input,
             self.expr.clone(),
-            self.output_rows.clone(),
-            self.sort_time_nanos.clone(),
+            baseline_metrics,
         )))
     }
 
@@ -166,11 +183,12 @@ impl ExecutionPlan for SortExec {
         }
     }
 
-    fn metrics(&self) -> HashMap<String, SQLMetric> {
-        let mut metrics = HashMap::new();
-        metrics.insert("outputRows".to_owned(), (*self.output_rows).clone());
-        metrics.insert("sortTime".to_owned(), (*self.sort_time_nanos).clone());
-        metrics
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn statistics(&self) -> Statistics {
+        self.input.statistics()
     }
 }
 
@@ -181,47 +199,25 @@ impl LambdaExecPlan for SortExec {
     }
 }
 
-fn sort_batches(
-    batches: &[RecordBatch],
-    schema: &SchemaRef,
+fn sort_batch(
+    batch: RecordBatch,
+    schema: SchemaRef,
     expr: &[PhysicalSortExpr],
-) -> ArrowResult<Option<RecordBatch>> {
-    if batches.is_empty() {
-        return Ok(None);
-    }
-    // combine all record batches into one for each column
-    let combined_batch = RecordBatch::try_new(
-        schema.clone(),
-        schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                concat(
-                    &batches
-                        .iter()
-                        .map(|batch| batch.column(i).as_ref())
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect::<ArrowResult<Vec<ArrayRef>>>()?,
-    )?;
-
-    // sort combined record batch
+) -> ArrowResult<RecordBatch> {
     // TODO: pushup the limit expression to sort
     let indices = lexsort_to_indices(
         &expr
             .iter()
-            .map(|e| e.evaluate_to_sort_column(&combined_batch))
+            .map(|e| e.evaluate_to_sort_column(&batch))
             .collect::<Result<Vec<SortColumn>>>()
             .map_err(DataFusionError::into_arrow_external_error)?,
         None,
     )?;
 
     // reorder all rows based on sorted indices
-    let sorted_batch = RecordBatch::try_new(
-        schema.clone(),
-        combined_batch
+    RecordBatch::try_new(
+        schema,
+        batch
             .columns()
             .iter()
             .map(|column| {
@@ -236,17 +232,16 @@ fn sort_batches(
                 )
             })
             .collect::<ArrowResult<Vec<ArrayRef>>>()?,
-    );
-    sorted_batch.map(Some)
+    )
 }
 
 pin_project! {
+    /// stream for sort plan
     struct SortStream {
         #[pin]
         output: futures::channel::oneshot::Receiver<ArrowResult<Option<RecordBatch>>>,
         finished: bool,
         schema: SchemaRef,
-        output_rows: Arc<SQLMetric>,
     }
 }
 
@@ -254,11 +249,9 @@ impl SortStream {
     fn new(
         input: SendableRecordBatchStream,
         expr: Vec<PhysicalSortExpr>,
-        output_rows: Arc<SQLMetric>,
-        sort_time: Arc<SQLMetric>,
+        baseline_metrics: BaselineMetrics,
     ) -> Self {
         let (tx, rx) = futures::channel::oneshot::channel();
-
         let schema = input.schema();
         tokio::spawn(async move {
             let schema = input.schema();
@@ -266,10 +259,16 @@ impl SortStream {
                 .await
                 .map_err(DataFusionError::into_arrow_external_error)
                 .and_then(move |batches| {
-                    let now = Instant::now();
-                    let result = sort_batches(&batches, &schema, &expr);
-                    sort_time.add(now.elapsed().as_nanos() as usize);
-                    result
+                    let timer = baseline_metrics.elapsed_compute().timer();
+                    // combine all record batches into one for each column
+                    let combined = common::combine_batches(&batches, schema.clone())?;
+                    // sort combined record batch
+                    let result = combined
+                        .map(|batch| sort_batch(batch, schema, &expr))
+                        .transpose()?
+                        .record_output(&baseline_metrics);
+                    timer.done();
+                    Ok(result)
                 });
 
             tx.send(sorted_batch)
@@ -279,7 +278,6 @@ impl SortStream {
             output: rx,
             finished: false,
             schema,
-            output_rows,
         }
     }
 }
@@ -288,8 +286,6 @@ impl Stream for SortStream {
     type Item = ArrowResult<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let output_rows = self.output_rows.clone();
-
         if self.finished {
             return Poll::Ready(None);
         }
@@ -308,10 +304,6 @@ impl Stream for SortStream {
                     Ok(result) => result.transpose(),
                 };
 
-                if let Some(Ok(batch)) = &result {
-                    output_rows.add(batch.num_rows());
-                }
-
                 Poll::Ready(result)
             }
             Poll::Pending => Poll::Pending,
@@ -328,9 +320,9 @@ impl RecordBatchStream for SortStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use crate::physical_plan::expressions::col;
     use crate::physical_plan::memory::MemoryExec;
-    use crate::physical_plan::merge::MergeExec;
     use crate::physical_plan::{
         collect,
         csv::{CsvExec, CsvReadOptions},
@@ -356,21 +348,21 @@ mod tests {
             vec![
                 // c1 string column
                 PhysicalSortExpr {
-                    expr: col("c1"),
+                    expr: col("c1", &schema)?,
                     options: SortOptions::default(),
                 },
                 // c2 uin32 column
                 PhysicalSortExpr {
-                    expr: col("c2"),
+                    expr: col("c2", &schema)?,
                     options: SortOptions::default(),
                 },
                 // c7 uin8 column
                 PhysicalSortExpr {
-                    expr: col("c7"),
+                    expr: col("c7", &schema)?,
                     options: SortOptions::default(),
                 },
             ],
-            Arc::new(MergeExec::new(Arc::new(csv))),
+            Arc::new(CoalescePartitionsExec::new(Arc::new(csv))),
         )?);
 
         let result: Vec<RecordBatch> = collect(sort_exec).await?;
@@ -430,14 +422,14 @@ mod tests {
         let sort_exec = Arc::new(SortExec::try_new(
             vec![
                 PhysicalSortExpr {
-                    expr: col("a"),
+                    expr: col("a", &schema)?,
                     options: SortOptions {
                         descending: true,
                         nulls_first: true,
                     },
                 },
                 PhysicalSortExpr {
-                    expr: col("b"),
+                    expr: col("b", &schema)?,
                     options: SortOptions {
                         descending: false,
                         nulls_first: false,
@@ -451,8 +443,9 @@ mod tests {
         assert_eq!(DataType::Float64, *sort_exec.schema().field(1).data_type());
 
         let result: Vec<RecordBatch> = collect(sort_exec.clone()).await?;
-        assert!(sort_exec.metrics().get("sortTime").unwrap().value() > 0);
-        assert_eq!(sort_exec.metrics().get("outputRows").unwrap().value(), 8);
+        let metrics = sort_exec.metrics().unwrap();
+        assert!(metrics.elapsed_compute().unwrap() > 0);
+        assert_eq!(metrics.output_rows().unwrap(), 8);
         assert_eq!(result.len(), 1);
 
         let columns = result[0].columns();

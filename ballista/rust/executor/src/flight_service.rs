@@ -18,33 +18,28 @@
 //! Implementation of the Apache Arrow Flight protocol that wraps an executor.
 
 use std::fs::File;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
 
+use crate::executor::Executor;
+use arrow_flight::SchemaAsIpc;
 use ballista_core::error::BallistaError;
 use ballista_core::serde::decode_protobuf;
-use ballista_core::serde::scheduler::{Action as BallistaAction, PartitionStats};
-use ballista_core::utils::{self, format_plan};
+use ballista_core::serde::scheduler::Action as BallistaAction;
 
-use arrow::array::{ArrayRef, StringBuilder};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::error::ArrowError;
-use arrow::ipc::reader::FileReader;
-use arrow::ipc::writer::IpcWriteOptions;
-use arrow::record_batch::RecordBatch;
 use arrow_flight::{
     flight_service_server::FlightService, Action, ActionType, Criteria, Empty,
     FlightData, FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse,
     PutResult, SchemaResult, Ticket,
 };
-use datafusion::error::DataFusionError;
+use datafusion::arrow::{
+    error::ArrowError, ipc::reader::FileReader, ipc::writer::IpcWriteOptions,
+    record_batch::RecordBatch,
+};
 use futures::{Stream, StreamExt};
 use log::{info, warn};
 use std::io::{Read, Seek};
 use tokio::sync::mpsc::channel;
-use tokio::task::JoinHandle;
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     task,
@@ -58,12 +53,13 @@ type FlightDataReceiver = Receiver<Result<FlightData, Status>>;
 /// Service implementing the Apache Arrow Flight Protocol
 #[derive(Clone)]
 pub struct BallistaFlightService {
-    work_dir: String,
+    /// Executor
+    executor: Arc<Executor>,
 }
 
 impl BallistaFlightService {
-    pub fn new(work_dir: String) -> Self {
-        Self { work_dir }
+    pub fn new(executor: Arc<Executor>) -> Self {
+        Self { executor }
     }
 }
 
@@ -85,135 +81,13 @@ impl FlightService for BallistaFlightService {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket = request.into_inner();
-        info!("Received do_get request");
 
         let action =
             decode_protobuf(&ticket.ticket).map_err(|e| from_ballista_err(&e))?;
 
         match &action {
-            BallistaAction::ExecutePartition(partition) => {
-                info!(
-                    "ExecutePartition: job={}, stage={}, partition={:?}\n{}",
-                    partition.job_id,
-                    partition.stage_id,
-                    partition.partition_id,
-                    format_plan(partition.plan.as_ref(), 0)
-                        .map_err(|e| from_ballista_err(&e))?
-                );
-
-                let mut tasks: Vec<JoinHandle<Result<_, BallistaError>>> = vec![];
-                for &part in &partition.partition_id {
-                    let mut path = PathBuf::from(&self.work_dir);
-                    let partition = partition.clone();
-                    tasks.push(tokio::spawn(async move {
-                        path.push(partition.job_id);
-                        path.push(&format!("{}", partition.stage_id));
-                        path.push(&format!("{}", part));
-                        std::fs::create_dir_all(&path)?;
-
-                        path.push("data.arrow");
-                        let path = path.to_str().unwrap();
-                        info!("Writing results to {}", path);
-
-                        let now = Instant::now();
-
-                        // execute the query partition
-                        let mut stream = partition
-                            .plan
-                            .execute(part)
-                            .await
-                            .map_err(|e| from_datafusion_err(&e))?;
-
-                        // stream results to disk
-                        let stats = utils::write_stream_to_disk(&mut stream, &path)
-                            .await
-                            .map_err(|e| from_ballista_err(&e))?;
-
-                        info!(
-                            "Executed partition {} in {} seconds. Statistics: {:?}",
-                            part,
-                            now.elapsed().as_secs(),
-                            stats
-                        );
-
-                        let mut flights: Vec<Result<FlightData, Status>> = vec![];
-                        let options = arrow::ipc::writer::IpcWriteOptions::default();
-
-                        let schema = Arc::new(Schema::new(vec![
-                            Field::new("path", DataType::Utf8, false),
-                            stats.arrow_struct_repr(),
-                        ]));
-
-                        // build result set with summary of the partition execution status
-                        let mut c0 = StringBuilder::new(1);
-                        c0.append_value(&path).unwrap();
-                        let path: ArrayRef = Arc::new(c0.finish());
-
-                        let stats: ArrayRef = stats.to_arrow_arrayref()?;
-                        let results = vec![RecordBatch::try_new(
-                            schema,
-                            vec![path, stats],
-                        )
-                        .unwrap()];
-
-                        let mut batches: Vec<Result<FlightData, Status>> = results
-                            .iter()
-                            .flat_map(|batch| create_flight_iter(batch, &options))
-                            .collect();
-
-                        // append batch vector to schema vector, so that the first message sent is the schema
-                        flights.append(&mut batches);
-
-                        Ok(flights)
-                    }));
-                }
-
-                // wait for all partitions to complete
-                let results = futures::future::join_all(tasks).await;
-
-                // get results
-                let mut flights: Vec<Result<FlightData, Status>> = vec![];
-
-                // add an initial FlightData message that sends schema
-                let options = arrow::ipc::writer::IpcWriteOptions::default();
-                let stats = PartitionStats::default();
-                let schema = Arc::new(Schema::new(vec![
-                    Field::new("path", DataType::Utf8, false),
-                    stats.arrow_struct_repr(),
-                ]));
-                let schema_flight_data =
-                    arrow_flight::utils::flight_data_from_arrow_schema(
-                        schema.as_ref(),
-                        &options,
-                    );
-                flights.push(Ok(schema_flight_data));
-
-                // collect statistics from each executed partition
-                for result in results {
-                    let result = result.map_err(|e| {
-                        Status::internal(format!("Ballista Error: {:?}", e))
-                    })?;
-                    let batches = result.map_err(|e| {
-                        Status::internal(format!("Ballista Error: {:?}", e))
-                    })?;
-                    flights.extend_from_slice(&batches);
-                }
-
-                let output = futures::stream::iter(flights);
-                Ok(Response::new(Box::pin(output) as Self::DoGetStream))
-            }
-            BallistaAction::FetchPartition(partition_id) => {
-                // fetch a partition that was previously executed by this executor
-                info!("FetchPartition {:?}", partition_id);
-
-                let mut path = PathBuf::from(&self.work_dir);
-                path.push(&partition_id.job_id);
-                path.push(&format!("{}", partition_id.stage_id));
-                path.push(&format!("{}", partition_id.partition_id));
-                path.push("data.arrow");
-                let path = path.to_str().unwrap();
-
-                info!("FetchPartition {:?} reading {}", partition_id, path);
+            BallistaAction::FetchPartition { path, .. } => {
+                info!("FetchPartition reading {}", &path);
                 let file = File::open(&path)
                     .map_err(|e| {
                         BallistaError::General(format!(
@@ -316,7 +190,7 @@ fn create_flight_iter(
     options: &IpcWriteOptions,
 ) -> Box<dyn Iterator<Item = Result<FlightData, Status>>> {
     let (flight_dictionaries, flight_batch) =
-        arrow_flight::utils::flight_data_from_arrow_batch(batch, &options);
+        arrow_flight::utils::flight_data_from_arrow_batch(batch, options);
     Box::new(
         flight_dictionaries
             .into_iter()
@@ -333,20 +207,22 @@ where
     T: Read + Seek,
 {
     let options = arrow::ipc::writer::IpcWriteOptions::default();
-    let schema_flight_data = arrow_flight::utils::flight_data_from_arrow_schema(
-        reader.schema().as_ref(),
-        &options,
-    );
+    let schema_flight_data = SchemaAsIpc::new(reader.schema().as_ref(), &options).into();
     send_response(&tx, Ok(schema_flight_data)).await?;
 
+    let mut row_count = 0;
     for batch in reader {
+        if let Ok(x) = &batch {
+            row_count += x.num_rows();
+        }
         let batch_flight_data: Vec<_> = batch
             .map(|b| create_flight_iter(&b, &options).collect())
             .map_err(|e| from_arrow_err(&e))?;
-        for batch in &batch_flight_data {
-            send_response(&tx, batch.clone()).await?;
+        for batch in batch_flight_data.into_iter() {
+            send_response(&tx, batch).await?;
         }
     }
+    info!("FetchPartition streamed {} rows", row_count);
     Ok(())
 }
 
@@ -365,8 +241,4 @@ fn from_arrow_err(e: &ArrowError) -> Status {
 
 fn from_ballista_err(e: &ballista_core::error::BallistaError) -> Status {
     Status::internal(format!("Ballista Error: {:?}", e))
-}
-
-fn from_datafusion_err(e: &DataFusionError) -> Status {
-    Status::internal(format!("DataFusion Error: {:?}", e))
 }

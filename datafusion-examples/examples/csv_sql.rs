@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::arrow::util::pretty;
-
 use datafusion::error::Result;
 use datafusion::prelude::*;
 
@@ -27,7 +25,7 @@ async fn main() -> Result<()> {
     // create local execution context
     let mut ctx = ExecutionContext::new();
 
-    let testdata = datafusion::arrow::util::test_util::arrow_test_data();
+    let testdata = datafusion::test_util::arrow_test_data();
 
     // register csv file with the execution context
     ctx.register_csv(
@@ -43,10 +41,9 @@ async fn main() -> Result<()> {
         WHERE c11 > 0.1 AND c11 < 0.9 \
         GROUP BY c1",
     )?;
-    let results = df.collect().await?;
 
     // print the results
-    pretty::print_batches(&results)?;
+    df.show().await?;
 
     Ok(())
 }

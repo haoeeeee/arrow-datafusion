@@ -29,28 +29,40 @@ use crate::physical_plan::{ColumnarValue, PhysicalExpr};
 use serde::{Deserialize, Serialize};
 
 /// Represents the column at a given index in a RecordBatch
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct Column {
     name: String,
+    index: usize,
 }
 
 impl Column {
     /// Create a new column expression
-    pub fn new(name: &str) -> Self {
+    pub fn new(name: &str, index: usize) -> Self {
         Self {
             name: name.to_owned(),
+            index,
         }
+    }
+
+    /// Create a new column expression based on column name and schema
+    pub fn new_with_schema(name: &str, schema: &Schema) -> Result<Self> {
+        Ok(Column::new(name, schema.index_of(name)?))
     }
 
     /// Get the column name
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// Get the column index
+    pub fn index(&self) -> usize {
+        self.index
+    }
 }
 
 impl std::fmt::Display for Column {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.name)
+        write!(f, "{}@{}", self.name, self.index)
     }
 }
 
@@ -63,26 +75,21 @@ impl PhysicalExpr for Column {
 
     /// Get the data type of this expression, given the schema of the input
     fn data_type(&self, input_schema: &Schema) -> Result<DataType> {
-        Ok(input_schema
-            .field_with_name(&self.name)?
-            .data_type()
-            .clone())
+        Ok(input_schema.field(self.index).data_type().clone())
     }
 
     /// Decide whehter this expression is nullable, given the schema of the input
     fn nullable(&self, input_schema: &Schema) -> Result<bool> {
-        Ok(input_schema.field_with_name(&self.name)?.is_nullable())
+        Ok(input_schema.field(self.index).is_nullable())
     }
 
     /// Evaluate the expression
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        Ok(ColumnarValue::Array(
-            batch.column(batch.schema().index_of(&self.name)?).clone(),
-        ))
+        Ok(ColumnarValue::Array(batch.column(self.index).clone()))
     }
 }
 
 /// Create a column expression
-pub fn col(name: &str) -> Arc<dyn PhysicalExpr> {
-    Arc::new(Column::new(name))
+pub fn col(name: &str, schema: &Schema) -> Result<Arc<dyn PhysicalExpr>> {
+    Ok(Arc::new(Column::new_with_schema(name, schema)?))
 }

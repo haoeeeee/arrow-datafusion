@@ -21,10 +21,12 @@ use crate::{
         catalog::{CatalogList, MemoryCatalogList},
         information_schema::CatalogWithInformationSchema,
     },
-    optimizer::{
-        eliminate_limit::EliminateLimit, hash_build_probe_order::HashBuildProbeOrder,
+    logical_plan::{PlanType, ToStringifiedPlan},
+    optimizer::eliminate_limit::EliminateLimit,
+    physical_optimizer::{
+        aggregate_statistics::AggregateStatistics,
+        hash_build_probe_order::HashBuildProbeOrder, optimizer::PhysicalOptimizerRule,
     },
-    physical_optimizer::optimizer::PhysicalOptimizerRule,
 };
 use log::debug;
 use std::fs;
@@ -47,22 +49,26 @@ use crate::catalog::{
     ResolvedTableReference, TableReference,
 };
 use crate::datasource::csv::CsvFile;
+use crate::datasource::object_store::{ObjectStore, ObjectStoreRegistry};
 use crate::datasource::parquet::ParquetTable;
 use crate::datasource::TableProvider;
 use crate::error::{DataFusionError, Result};
 use crate::execution::dataframe_impl::DataFrameImpl;
 use crate::logical_plan::{
-    FunctionRegistry, LogicalPlan, LogicalPlanBuilder, ToDFSchema,
+    FunctionRegistry, LogicalPlan, LogicalPlanBuilder, UNNAMED_TABLE,
 };
 use crate::optimizer::constant_folding::ConstantFolding;
 use crate::optimizer::filter_push_down::FilterPushDown;
 use crate::optimizer::limit_push_down::LimitPushDown;
 use crate::optimizer::optimizer::OptimizerRule;
 use crate::optimizer::projection_push_down::ProjectionPushDown;
+use crate::optimizer::simplify_expressions::SimplifyExpressions;
 use crate::physical_optimizer::coalesce_batches::CoalesceBatches;
-use crate::physical_optimizer::merge_exec::AddMergeExec;
+use crate::physical_optimizer::merge_exec::AddCoalescePartitionsExec;
 use crate::physical_optimizer::repartition::Repartition;
 
+use crate::datasource::avro::AvroFile;
+use crate::physical_plan::avro::AvroReadOptions;
 use crate::physical_plan::csv::CsvReadOptions;
 use crate::physical_plan::planner::DefaultPhysicalPlanner;
 use crate::physical_plan::udf::ScalarUDF;
@@ -142,7 +148,7 @@ impl ExecutionContext {
 
             let default_catalog: Arc<dyn CatalogProvider> = if config.information_schema {
                 Arc::new(CatalogWithInformationSchema::new(
-                    catalog_list.clone(),
+                    Arc::downgrade(&catalog_list),
                     Arc::new(default_catalog),
                 ))
             } else {
@@ -161,6 +167,7 @@ impl ExecutionContext {
                 aggregate_functions: HashMap::new(),
                 config,
                 execution_props: ExecutionProps::new(),
+                object_store_registry: Arc::new(ObjectStoreRegistry::new()),
             })),
         }
     }
@@ -189,6 +196,11 @@ impl ExecutionContext {
                 }
                 FileType::Parquet => {
                     self.register_parquet(name, location)?;
+                    let plan = LogicalPlanBuilder::empty(false).build()?;
+                    Ok(Arc::new(DataFrameImpl::new(self.state.clone(), &plan)))
+                }
+                FileType::Avro => {
+                    self.register_avro(name, location, AvroReadOptions::default())?;
                     let plan = LogicalPlanBuilder::empty(false).build()?;
                     Ok(Arc::new(DataFrameImpl::new(self.state.clone(), &plan)))
                 }
@@ -266,26 +278,42 @@ impl ExecutionContext {
             .insert(f.name.clone(), Arc::new(f));
     }
 
+    /// Creates a DataFrame for reading an Avro data source.
+
+    pub fn read_avro(
+        &mut self,
+        filename: impl Into<String>,
+        options: AvroReadOptions,
+    ) -> Result<Arc<dyn DataFrame>> {
+        Ok(Arc::new(DataFrameImpl::new(
+            self.state.clone(),
+            &LogicalPlanBuilder::scan_avro(filename, options, None)?.build()?,
+        )))
+    }
+
     /// Creates a DataFrame for reading a CSV data source.
     pub fn read_csv(
         &mut self,
-        filename: &str,
+        filename: impl Into<String>,
         options: CsvReadOptions,
     ) -> Result<Arc<dyn DataFrame>> {
         Ok(Arc::new(DataFrameImpl::new(
             self.state.clone(),
-            &LogicalPlanBuilder::scan_csv(&filename, options, None)?.build()?,
+            &LogicalPlanBuilder::scan_csv(filename, options, None)?.build()?,
         )))
     }
 
     /// Creates a DataFrame for reading a Parquet data source.
-    pub fn read_parquet(&mut self, filename: &str) -> Result<Arc<dyn DataFrame>> {
+    pub fn read_parquet(
+        &mut self,
+        filename: impl Into<String>,
+    ) -> Result<Arc<dyn DataFrame>> {
         Ok(Arc::new(DataFrameImpl::new(
             self.state.clone(),
             &LogicalPlanBuilder::scan_parquet(
-                &filename,
+                filename,
                 None,
-                self.state.lock().unwrap().config.concurrency,
+                self.state.lock().unwrap().config.target_partitions,
             )?
             .build()?,
         )))
@@ -296,18 +324,9 @@ impl ExecutionContext {
         &mut self,
         provider: Arc<dyn TableProvider>,
     ) -> Result<Arc<dyn DataFrame>> {
-        let schema = provider.schema();
-        let table_scan = LogicalPlan::TableScan {
-            table_name: "".to_string(),
-            source: provider,
-            projected_schema: schema.to_dfschema_ref()?,
-            projection: None,
-            filters: vec![],
-            limit: None,
-        };
         Ok(Arc::new(DataFrameImpl::new(
             self.state.clone(),
-            &LogicalPlanBuilder::from(&table_scan).build()?,
+            &LogicalPlanBuilder::scan(UNNAMED_TABLE, provider, None)?.build()?,
         )))
     }
 
@@ -326,11 +345,24 @@ impl ExecutionContext {
     /// Registers a Parquet data source so that it can be referenced from SQL statements
     /// executed against this context.
     pub fn register_parquet(&mut self, name: &str, filename: &str) -> Result<()> {
-        let table = ParquetTable::try_new(
-            &filename,
-            self.state.lock().unwrap().config.concurrency,
-        )?;
+        let table = {
+            let m = self.state.lock().unwrap();
+            ParquetTable::try_new(filename, m.config.target_partitions)?
+                .with_enable_pruning(m.config.parquet_pruning)
+        };
         self.register_table(name, Arc::new(table))?;
+        Ok(())
+    }
+
+    /// Registers an Avro data source so that it can be referenced from SQL statements
+    /// executed against this context.
+    pub fn register_avro(
+        &mut self,
+        name: &str,
+        filename: &str,
+        options: AvroReadOptions,
+    ) -> Result<()> {
+        self.register_table(name, Arc::new(AvroFile::try_new(filename, options)?))?;
         Ok(())
     }
 
@@ -350,7 +382,7 @@ impl ExecutionContext {
         let state = self.state.lock().unwrap();
         let catalog = if state.config.information_schema {
             Arc::new(CatalogWithInformationSchema::new(
-                state.catalog_list.clone(),
+                Arc::downgrade(&state.catalog_list),
                 catalog,
             ))
         } else {
@@ -363,6 +395,29 @@ impl ExecutionContext {
     /// Retrieves a `CatalogProvider` instance by name
     pub fn catalog(&self, name: &str) -> Option<Arc<dyn CatalogProvider>> {
         self.state.lock().unwrap().catalog_list.catalog(name)
+    }
+
+    /// Registers a object store with scheme using a custom `ObjectStore` so that
+    /// an external file system or object storage system could be used against this context.
+    ///
+    /// Returns the `ObjectStore` previously registered for this scheme, if any
+    pub fn register_object_store(
+        &self,
+        scheme: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Option<Arc<dyn ObjectStore>> {
+        let scheme = scheme.into();
+
+        self.state
+            .lock()
+            .unwrap()
+            .object_store_registry
+            .register_store(scheme, object_store)
+    }
+
+    /// Retrieves a `ObjectStore` instance by scheme
+    pub fn object_store(&self, scheme: &str) -> Option<Arc<dyn ObjectStore>> {
+        self.state.lock().unwrap().object_store_registry.get(scheme)
     }
 
     /// Registers a table using a custom `TableProvider` so that
@@ -409,22 +464,15 @@ impl ExecutionContext {
     ) -> Result<Arc<dyn DataFrame>> {
         let table_ref = table_ref.into();
         let schema = self.state.lock().unwrap().schema_for_ref(table_ref)?;
-
         match schema.table(table_ref.table()) {
             Some(ref provider) => {
-                let schema = provider.schema();
-                let table_scan = LogicalPlan::TableScan {
-                    table_name: table_ref.table().to_owned(),
-                    source: Arc::clone(provider),
-                    projected_schema: schema.to_dfschema_ref()?,
-                    projection: None,
-                    filters: vec![],
-                    limit: None,
-                };
-                Ok(Arc::new(DataFrameImpl::new(
-                    self.state.clone(),
-                    &LogicalPlanBuilder::from(&table_scan).build()?,
-                )))
+                let plan = LogicalPlanBuilder::scan(
+                    table_ref.table(),
+                    Arc::clone(provider),
+                    None,
+                )?
+                .build()?;
+                Ok(Arc::new(DataFrameImpl::new(self.state.clone(), &plan)))
             }
             _ => Err(DataFusionError::Plan(format!(
                 "No table named '{}'",
@@ -456,19 +504,31 @@ impl ExecutionContext {
 
     /// Optimizes the logical plan by applying optimizer rules.
     pub fn optimize(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
-        let state = &mut self.state.lock().unwrap();
-        let execution_props = &mut state.execution_props.clone();
-        let optimizers = &state.config.optimizers;
+        if let LogicalPlan::Explain {
+            verbose,
+            plan,
+            stringified_plans,
+            schema,
+        } = plan
+        {
+            let mut stringified_plans = stringified_plans.clone();
 
-        let execution_props = execution_props.start_execution();
+            // optimize the child plan, capturing the output of each optimizer
+            let plan = self.optimize_internal(plan, |optimized_plan, optimizer| {
+                let optimizer_name = optimizer.name().to_string();
+                let plan_type = PlanType::OptimizedLogicalPlan { optimizer_name };
+                stringified_plans.push(optimized_plan.to_stringified(plan_type));
+            })?;
 
-        let mut new_plan = plan.clone();
-        debug!("Logical plan:\n {:?}", plan);
-        for optimizer in optimizers {
-            new_plan = optimizer.optimize(&new_plan, execution_props)?;
+            Ok(LogicalPlan::Explain {
+                verbose: *verbose,
+                plan: Arc::new(plan),
+                stringified_plans,
+                schema: schema.clone(),
+            })
+        } else {
+            self.optimize_internal(plan, |_, _| {})
         }
-        debug!("Optimized logical plan:\n {:?}", new_plan);
-        Ok(new_plan)
     }
 
     /// Creates a physical plan from a logical plan.
@@ -489,10 +549,11 @@ impl ExecutionContext {
     pub async fn write_csv(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        path: String,
+        path: impl AsRef<str>,
     ) -> Result<()> {
+        let path = path.as_ref();
         // create directory to contain the CSV files (one per partition)
-        let fs_path = Path::new(&path);
+        let fs_path = Path::new(path);
         match fs::create_dir(fs_path) {
             Ok(()) => {
                 let mut tasks = vec![];
@@ -526,11 +587,12 @@ impl ExecutionContext {
     pub async fn write_parquet(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        path: String,
+        path: impl AsRef<str>,
         writer_properties: Option<WriterProperties>,
     ) -> Result<()> {
+        let path = path.as_ref();
         // create directory to contain the Parquet files (one per partition)
-        let fs_path = Path::new(&path);
+        let fs_path = Path::new(path);
         match fs::create_dir(fs_path) {
             Ok(()) => {
                 let mut tasks = vec![];
@@ -563,6 +625,32 @@ impl ExecutionContext {
                 path, e
             ))),
         }
+    }
+
+    /// Optimizes the logical plan by applying optimizer rules, and
+    /// invoking observer function after each call
+    fn optimize_internal<F>(
+        &self,
+        plan: &LogicalPlan,
+        mut observer: F,
+    ) -> Result<LogicalPlan>
+    where
+        F: FnMut(&LogicalPlan, &dyn OptimizerRule),
+    {
+        let state = &mut self.state.lock().unwrap();
+        let execution_props = &mut state.execution_props.clone();
+        let optimizers = &state.config.optimizers;
+
+        let execution_props = execution_props.start_execution();
+
+        let mut new_plan = plan.clone();
+        debug!("Logical plan:\n {:?}", plan);
+        for optimizer in optimizers {
+            new_plan = optimizer.optimize(&new_plan, execution_props)?;
+            observer(&new_plan, optimizer.as_ref());
+        }
+        debug!("Optimized logical plan:\n {:?}", new_plan);
+        Ok(new_plan)
     }
 }
 
@@ -614,8 +702,8 @@ impl QueryPlanner for DefaultQueryPlanner {
 /// Configuration options for execution context
 #[derive(Clone)]
 pub struct ExecutionConfig {
-    /// Number of concurrent threads for query execution.
-    pub concurrency: usize,
+    /// Number of partitions for query execution. Increasing partitions can increase concurrency.
+    pub target_partitions: usize,
     /// Default batch size when reading data sources
     pub batch_size: usize,
     /// Responsible for optimizing a logical plan
@@ -634,31 +722,37 @@ pub struct ExecutionConfig {
     /// virtual tables for displaying schema information
     information_schema: bool,
     /// Should DataFusion repartition data using the join keys to execute joins in parallel
-    /// using the provided `concurrency` level
+    /// using the provided `target_partitions` level
     pub repartition_joins: bool,
     /// Should DataFusion repartition data using the aggregate keys to execute aggregates in parallel
-    /// using the provided `concurrency` level
+    /// using the provided `target_partitions` level
     pub repartition_aggregations: bool,
+    /// Should DataFusion repartition data using the partition keys to execute window functions in
+    /// parallel using the provided `target_partitions` level
+    pub repartition_windows: bool,
+    /// Should Datafusion parquet reader using the predicate to prune data
+    parquet_pruning: bool,
 }
 
-impl ExecutionConfig {
-    /// Create an execution config with default setting
-    pub fn new() -> Self {
+impl Default for ExecutionConfig {
+    fn default() -> Self {
         Self {
-            concurrency: num_cpus::get(),
+            target_partitions: num_cpus::get(),
             batch_size: 8192,
             optimizers: vec![
                 Arc::new(ConstantFolding::new()),
                 Arc::new(EliminateLimit::new()),
                 Arc::new(ProjectionPushDown::new()),
                 Arc::new(FilterPushDown::new()),
-                Arc::new(HashBuildProbeOrder::new()),
+                Arc::new(SimplifyExpressions::new()),
                 Arc::new(LimitPushDown::new()),
             ],
             physical_optimizers: vec![
+                Arc::new(AggregateStatistics::new()),
+                Arc::new(HashBuildProbeOrder::new()),
                 Arc::new(CoalesceBatches::new()),
                 Arc::new(Repartition::new()),
-                Arc::new(AddMergeExec::new()),
+                Arc::new(AddCoalescePartitionsExec::new()),
             ],
             query_planner: Arc::new(DefaultQueryPlanner {}),
             default_catalog: "datafusion".to_owned(),
@@ -667,14 +761,32 @@ impl ExecutionConfig {
             information_schema: false,
             repartition_joins: true,
             repartition_aggregations: true,
+            repartition_windows: true,
+            parquet_pruning: true,
         }
     }
+}
 
-    /// Customize max_concurrency
-    pub fn with_concurrency(mut self, n: usize) -> Self {
-        // concurrency must be greater than zero
+impl ExecutionConfig {
+    /// Create an execution config with default setting
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    /// Deprecated. Use with_target_partitions instead.
+    #[deprecated(
+        since = "5.1.0",
+        note = "This method is deprecated in favor of `with_target_partitions`."
+    )]
+    pub fn with_concurrency(self, n: usize) -> Self {
+        self.with_target_partitions(n)
+    }
+
+    /// Customize target_partitions
+    pub fn with_target_partitions(mut self, n: usize) -> Self {
+        // partition count must be greater than zero
         assert!(n > 0);
-        self.concurrency = n;
+        self.target_partitions = n;
         self
     }
 
@@ -750,9 +862,22 @@ impl ExecutionConfig {
         self.repartition_joins = enabled;
         self
     }
+
     /// Enables or disables the use of repartitioning for aggregations to improve parallelism
     pub fn with_repartition_aggregations(mut self, enabled: bool) -> Self {
         self.repartition_aggregations = enabled;
+        self
+    }
+
+    /// Enables or disables the use of repartitioning for window functions to improve parallelism
+    pub fn with_repartition_windows(mut self, enabled: bool) -> Self {
+        self.repartition_windows = enabled;
+        self
+    }
+
+    /// Enables or disables the use of pruning predicate for parquet readers to skip row groups
+    pub fn with_parquet_pruning(mut self, enabled: bool) -> Self {
+        self.parquet_pruning = enabled;
         self
     }
 }
@@ -781,6 +906,8 @@ pub struct ExecutionContextState {
     pub config: ExecutionConfig,
     /// Execution properties
     pub execution_props: ExecutionProps,
+    /// Object Store that are registered with the context
+    pub object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
 impl ExecutionProps {
@@ -808,6 +935,7 @@ impl ExecutionContextState {
             aggregate_functions: HashMap::new(),
             config: ExecutionConfig::new(),
             execution_props: ExecutionProps::new(),
+            object_store_registry: Arc::new(ObjectStoreRegistry::new()),
         }
     }
 
@@ -901,23 +1029,68 @@ mod tests {
         logical_plan::{col, create_udf, sum, Expr},
     };
     use crate::{
-        datasource::{MemTable, TableType},
+        datasource::{empty::EmptyTable, MemTable, TableType},
         logical_plan::create_udaf,
         physical_plan::expressions::AvgAccumulator,
     };
     use arrow::array::{
-        Array, ArrayRef, BinaryArray, DictionaryArray, Float64Array, Int32Array,
-        Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
-        TimestampNanosecondArray,
+        Array, ArrayRef, BinaryArray, DictionaryArray, Float32Array, Float64Array,
+        Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
+        LargeStringArray, StringArray, TimestampNanosecondArray, UInt16Array,
+        UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow::compute::add;
     use arrow::datatypes::*;
     use arrow::record_batch::RecordBatch;
     use std::fs::File;
+    use std::sync::Weak;
     use std::thread::{self, JoinHandle};
     use std::{io::prelude::*, sync::Mutex};
     use tempfile::TempDir;
     use test::*;
+
+    #[test]
+    fn optimize_explain() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+
+        let plan = LogicalPlanBuilder::scan_empty(Some("employee"), &schema, None)
+            .unwrap()
+            .explain(true, false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        if let LogicalPlan::Explain {
+            stringified_plans, ..
+        } = &plan
+        {
+            assert_eq!(stringified_plans.len(), 1);
+        } else {
+            panic!("plan was not an explain: {:?}", plan);
+        }
+
+        // now optimize the plan and expect to see more plans
+        let optimized_plan = ExecutionContext::new().optimize(&plan).unwrap();
+        if let LogicalPlan::Explain {
+            stringified_plans, ..
+        } = &optimized_plan
+        {
+            // should have more than one plan
+            assert!(
+                stringified_plans.len() > 1,
+                "plans: {:#?}",
+                stringified_plans
+            );
+            // should have at least one optimized plan
+            let opt = stringified_plans
+                .iter()
+                .any(|p| matches!(p.plan_type, PlanType::OptimizedLogicalPlan { .. }));
+
+            assert!(opt, "plans: {:#?}", stringified_plans);
+        } else {
+            panic!("plan was not an explain: {:?}", plan);
+        }
+    }
 
     #[tokio::test]
     async fn parallel_projection() -> Result<()> {
@@ -1030,7 +1203,6 @@ mod tests {
         let logical_plan = ctx.optimize(&logical_plan)?;
 
         let physical_plan = ctx.create_physical_plan(&logical_plan)?;
-        println!("{:?}", physical_plan);
 
         let results = collect_partitioned(physical_plan).await?;
 
@@ -1082,7 +1254,7 @@ mod tests {
         let ctx = create_ctx(&tmp_dir, partition_count)?;
 
         let table = ctx.table("test")?;
-        let logical_plan = LogicalPlanBuilder::from(&table.to_logical_plan())
+        let logical_plan = LogicalPlanBuilder::from(table.to_logical_plan())
             .project(vec![col("c2")])?
             .build()?;
 
@@ -1102,7 +1274,7 @@ mod tests {
             _ => panic!("expect optimized_plan to be projection"),
         }
 
-        let expected = "Projection: #c2\
+        let expected = "Projection: #test.c2\
         \n  TableScan: test projection=Some([1])";
         assert_eq!(format!("{:?}", optimized_plan), expected);
 
@@ -1123,18 +1295,15 @@ mod tests {
         let ctx = create_ctx(&tmp_dir, 1)?;
 
         let schema: Schema = ctx.table("test").unwrap().schema().clone().into();
-        assert_eq!(schema.field_with_name("c1")?.is_nullable(), false);
+        assert!(!schema.field_with_name("c1")?.is_nullable());
 
-        let plan = LogicalPlanBuilder::scan_empty("", &schema, None)?
+        let plan = LogicalPlanBuilder::scan_empty(None, &schema, None)?
             .project(vec![col("c1")])?
             .build()?;
 
         let plan = ctx.optimize(&plan)?;
         let physical_plan = ctx.create_physical_plan(&Arc::new(plan))?;
-        assert_eq!(
-            physical_plan.schema().field_with_name("c1")?.is_nullable(),
-            false
-        );
+        assert!(!physical_plan.schema().field_with_name("c1")?.is_nullable());
         Ok(())
     }
 
@@ -1178,8 +1347,11 @@ mod tests {
             _ => panic!("expect optimized_plan to be projection"),
         }
 
-        let expected = "Projection: #b\
-        \n  TableScan: projection=Some([1])";
+        let expected = format!(
+            "Projection: #{}.b\
+        \n  TableScan: {} projection=Some([1])",
+            UNNAMED_TABLE, UNNAMED_TABLE
+        );
         assert_eq!(format!("{:?}", optimized_plan), expected);
 
         let physical_plan = ctx.create_physical_plan(&optimized_plan)?;
@@ -1269,16 +1441,262 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn left_join_using() -> Result<()> {
+        let results = execute(
+            "SELECT t1.c1, t2.c2 FROM test t1 JOIN test t2 USING (c2) ORDER BY t2.c2",
+            1,
+        )
+        .await?;
+        assert_eq!(results.len(), 1);
+
+        let expected = vec![
+            "+----+----+",
+            "| c1 | c2 |",
+            "+----+----+",
+            "| 0  | 1  |",
+            "| 0  | 2  |",
+            "| 0  | 3  |",
+            "| 0  | 4  |",
+            "| 0  | 5  |",
+            "| 0  | 6  |",
+            "| 0  | 7  |",
+            "| 0  | 8  |",
+            "| 0  | 9  |",
+            "| 0  | 10 |",
+            "+----+----+",
+        ];
+
+        assert_batches_eq!(expected, &results);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn left_join_using_join_key_projection() -> Result<()> {
+        let results = execute(
+            "SELECT t1.c1, t1.c2, t2.c2 FROM test t1 JOIN test t2 USING (c2) ORDER BY t2.c2",
+            1,
+        )
+        .await?;
+        assert_eq!(results.len(), 1);
+
+        let expected = vec![
+            "+----+----+----+",
+            "| c1 | c2 | c2 |",
+            "+----+----+----+",
+            "| 0  | 1  | 1  |",
+            "| 0  | 2  | 2  |",
+            "| 0  | 3  | 3  |",
+            "| 0  | 4  | 4  |",
+            "| 0  | 5  | 5  |",
+            "| 0  | 6  | 6  |",
+            "| 0  | 7  | 7  |",
+            "| 0  | 8  | 8  |",
+            "| 0  | 9  | 9  |",
+            "| 0  | 10 | 10 |",
+            "+----+----+----+",
+        ];
+
+        assert_batches_eq!(expected, &results);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn left_join() -> Result<()> {
+        let results = execute(
+            "SELECT t1.c1, t1.c2, t2.c2 FROM test t1 JOIN test t2 ON t1.c2 = t2.c2 ORDER BY t1.c2",
+            1,
+        )
+        .await?;
+        assert_eq!(results.len(), 1);
+
+        let expected = vec![
+            "+----+----+----+",
+            "| c1 | c2 | c2 |",
+            "+----+----+----+",
+            "| 0  | 1  | 1  |",
+            "| 0  | 2  | 2  |",
+            "| 0  | 3  | 3  |",
+            "| 0  | 4  | 4  |",
+            "| 0  | 5  | 5  |",
+            "| 0  | 6  | 6  |",
+            "| 0  | 7  | 7  |",
+            "| 0  | 8  | 8  |",
+            "| 0  | 9  | 9  |",
+            "| 0  | 10 | 10 |",
+            "+----+----+----+",
+        ];
+
+        assert_batches_eq!(expected, &results);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn window() -> Result<()> {
+        let results = execute(
+            "SELECT \
+            c1, \
+            c2, \
+            SUM(c2) OVER (), \
+            COUNT(c2) OVER (), \
+            MAX(c2) OVER (), \
+            MIN(c2) OVER (), \
+            AVG(c2) OVER () \
+            FROM test \
+            ORDER BY c1, c2 \
+            LIMIT 5",
+            4,
+        )
+        .await?;
+        // result in one batch, although e.g. having 2 batches do not change
+        // result semantics, having a len=1 assertion upfront keeps surprises
+        // at bay
+        assert_eq!(results.len(), 1);
+
+        let expected = vec![
+            "+----+----+--------------+----------------+--------------+--------------+--------------+",
+            "| c1 | c2 | SUM(test.c2) | COUNT(test.c2) | MAX(test.c2) | MIN(test.c2) | AVG(test.c2) |",
+            "+----+----+--------------+----------------+--------------+--------------+--------------+",
+            "| 0  | 1  | 220          | 40             | 10           | 1            | 5.5          |",
+            "| 0  | 2  | 220          | 40             | 10           | 1            | 5.5          |",
+            "| 0  | 3  | 220          | 40             | 10           | 1            | 5.5          |",
+            "| 0  | 4  | 220          | 40             | 10           | 1            | 5.5          |",
+            "| 0  | 5  | 220          | 40             | 10           | 1            | 5.5          |",
+            "+----+----+--------------+----------------+--------------+--------------+--------------+",
+        ];
+
+        // window function shall respect ordering
+        assert_batches_eq!(expected, &results);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn window_order_by() -> Result<()> {
+        let results = execute(
+            "SELECT \
+            c1, \
+            c2, \
+            ROW_NUMBER() OVER (ORDER BY c1, c2), \
+            FIRST_VALUE(c2) OVER (ORDER BY c1, c2), \
+            LAST_VALUE(c2) OVER (ORDER BY c1, c2), \
+            NTH_VALUE(c2, 2) OVER (ORDER BY c1, c2), \
+            SUM(c2) OVER (ORDER BY c1, c2), \
+            COUNT(c2) OVER (ORDER BY c1, c2), \
+            MAX(c2) OVER (ORDER BY c1, c2), \
+            MIN(c2) OVER (ORDER BY c1, c2), \
+            AVG(c2) OVER (ORDER BY c1, c2) \
+            FROM test \
+            ORDER BY c1, c2 \
+            LIMIT 5",
+            4,
+        )
+        .await?;
+        // result in one batch, although e.g. having 2 batches do not change
+        // result semantics, having a len=1 assertion upfront keeps surprises
+        // at bay
+        assert_eq!(results.len(), 1);
+
+        let expected = vec![
+            "+----+----+--------------+----------------------+---------------------+-----------------------------+--------------+----------------+--------------+--------------+--------------+",
+            "| c1 | c2 | ROW_NUMBER() | FIRST_VALUE(test.c2) | LAST_VALUE(test.c2) | NTH_VALUE(test.c2,Int64(2)) | SUM(test.c2) | COUNT(test.c2) | MAX(test.c2) | MIN(test.c2) | AVG(test.c2) |",
+            "+----+----+--------------+----------------------+---------------------+-----------------------------+--------------+----------------+--------------+--------------+--------------+",
+            "| 0  | 1  | 1            | 1                    | 1                   |                             | 1            | 1              | 1            | 1            | 1            |",
+            "| 0  | 2  | 2            | 1                    | 2                   | 2                           | 3            | 2              | 2            | 1            | 1.5          |",
+            "| 0  | 3  | 3            | 1                    | 3                   | 2                           | 6            | 3              | 3            | 1            | 2            |",
+            "| 0  | 4  | 4            | 1                    | 4                   | 2                           | 10           | 4              | 4            | 1            | 2.5          |",
+            "| 0  | 5  | 5            | 1                    | 5                   | 2                           | 15           | 5              | 5            | 1            | 3            |",
+            "+----+----+--------------+----------------------+---------------------+-----------------------------+--------------+----------------+--------------+--------------+--------------+",
+        ];
+
+        // window function shall respect ordering
+        assert_batches_eq!(expected, &results);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn window_partition_by() -> Result<()> {
+        let results = execute(
+            "SELECT \
+            c1, \
+            c2, \
+            SUM(c2) OVER (PARTITION BY c2), \
+            COUNT(c2) OVER (PARTITION BY c2), \
+            MAX(c2) OVER (PARTITION BY c2), \
+            MIN(c2) OVER (PARTITION BY c2), \
+            AVG(c2) OVER (PARTITION BY c2) \
+            FROM test \
+            ORDER BY c1, c2 \
+            LIMIT 5",
+            4,
+        )
+        .await?;
+
+        let expected = vec![
+            "+----+----+--------------+----------------+--------------+--------------+--------------+",
+            "| c1 | c2 | SUM(test.c2) | COUNT(test.c2) | MAX(test.c2) | MIN(test.c2) | AVG(test.c2) |",
+            "+----+----+--------------+----------------+--------------+--------------+--------------+",
+            "| 0  | 1  | 4            | 4              | 1            | 1            | 1            |",
+            "| 0  | 2  | 8            | 4              | 2            | 2            | 2            |",
+            "| 0  | 3  | 12           | 4              | 3            | 3            | 3            |",
+            "| 0  | 4  | 16           | 4              | 4            | 4            | 4            |",
+            "| 0  | 5  | 20           | 4              | 5            | 5            | 5            |",
+            "+----+----+--------------+----------------+--------------+--------------+--------------+",
+        ];
+
+        // window function shall respect ordering
+        assert_batches_eq!(expected, &results);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn window_partition_by_order_by() -> Result<()> {
+        let results = execute(
+            "SELECT \
+            c1, \
+            c2, \
+            ROW_NUMBER() OVER (PARTITION BY c2 ORDER BY c1), \
+            FIRST_VALUE(c2 + c1) OVER (PARTITION BY c2 ORDER BY c1), \
+            LAST_VALUE(c2 + c1) OVER (PARTITION BY c2 ORDER BY c1), \
+            NTH_VALUE(c2 + c1, 1) OVER (PARTITION BY c2 ORDER BY c1), \
+            SUM(c2) OVER (PARTITION BY c2 ORDER BY c1), \
+            COUNT(c2) OVER (PARTITION BY c2 ORDER BY c1), \
+            MAX(c2) OVER (PARTITION BY c2 ORDER BY c1), \
+            MIN(c2) OVER (PARTITION BY c2 ORDER BY c1), \
+            AVG(c2) OVER (PARTITION BY c2 ORDER BY c1) \
+            FROM test \
+            ORDER BY c1, c2 \
+            LIMIT 5",
+            4,
+        )
+        .await?;
+
+        let expected = vec![
+            "+----+----+--------------+-----------------------------------+----------------------------------+------------------------------------------+--------------+----------------+--------------+--------------+--------------+",
+            "| c1 | c2 | ROW_NUMBER() | FIRST_VALUE(test.c2 Plus test.c1) | LAST_VALUE(test.c2 Plus test.c1) | NTH_VALUE(test.c2 Plus test.c1,Int64(1)) | SUM(test.c2) | COUNT(test.c2) | MAX(test.c2) | MIN(test.c2) | AVG(test.c2) |",
+            "+----+----+--------------+-----------------------------------+----------------------------------+------------------------------------------+--------------+----------------+--------------+--------------+--------------+",
+            "| 0  | 1  | 1            | 1                                 | 1                                | 1                                        | 1            | 1              | 1            | 1            | 1            |",
+            "| 0  | 2  | 1            | 2                                 | 2                                | 2                                        | 2            | 1              | 2            | 2            | 2            |",
+            "| 0  | 3  | 1            | 3                                 | 3                                | 3                                        | 3            | 1              | 3            | 3            | 3            |",
+            "| 0  | 4  | 1            | 4                                 | 4                                | 4                                        | 4            | 1              | 4            | 4            | 4            |",
+            "| 0  | 5  | 1            | 5                                 | 5                                | 5                                        | 5            | 1              | 5            | 5            | 5            |",
+            "+----+----+--------------+-----------------------------------+----------------------------------+------------------------------------------+--------------+----------------+--------------+--------------+--------------+",
+        ];
+
+        // window function shall respect ordering
+        assert_batches_eq!(expected, &results);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn aggregate() -> Result<()> {
         let results = execute("SELECT SUM(c1), SUM(c2) FROM test", 4).await?;
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+---------+---------+",
-            "| SUM(c1) | SUM(c2) |",
-            "+---------+---------+",
-            "| 60      | 220     |",
-            "+---------+---------+",
+            "+--------------+--------------+",
+            "| SUM(test.c1) | SUM(test.c2) |",
+            "+--------------+--------------+",
+            "| 60           | 220          |",
+            "+--------------+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1295,11 +1713,11 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+---------+---------+",
-            "| SUM(c1) | SUM(c2) |",
-            "+---------+---------+",
-            "|         |         |",
-            "+---------+---------+",
+            "+--------------+--------------+",
+            "| SUM(test.c1) | SUM(test.c2) |",
+            "+--------------+--------------+",
+            "|              |              |",
+            "+--------------+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1312,11 +1730,11 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+---------+---------+",
-            "| AVG(c1) | AVG(c2) |",
-            "+---------+---------+",
-            "| 1.5     | 5.5     |",
-            "+---------+---------+",
+            "+--------------+--------------+",
+            "| AVG(test.c1) | AVG(test.c2) |",
+            "+--------------+--------------+",
+            "| 1.5          | 5.5          |",
+            "+--------------+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1329,11 +1747,11 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+---------+---------+",
-            "| MAX(c1) | MAX(c2) |",
-            "+---------+---------+",
-            "| 3       | 10      |",
-            "+---------+---------+",
+            "+--------------+--------------+",
+            "| MAX(test.c1) | MAX(test.c2) |",
+            "+--------------+--------------+",
+            "| 3            | 10           |",
+            "+--------------+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1346,11 +1764,11 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+---------+---------+",
-            "| MIN(c1) | MIN(c2) |",
-            "+---------+---------+",
-            "| 0       | 1       |",
-            "+---------+---------+",
+            "+--------------+--------------+",
+            "| MIN(test.c1) | MIN(test.c2) |",
+            "+--------------+--------------+",
+            "| 0            | 1            |",
+            "+--------------+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1362,14 +1780,14 @@ mod tests {
         let results = execute("SELECT c1, SUM(c2) FROM test GROUP BY c1", 4).await?;
 
         let expected = vec![
-            "+----+---------+",
-            "| c1 | SUM(c2) |",
-            "+----+---------+",
-            "| 0  | 55      |",
-            "| 1  | 55      |",
-            "| 2  | 55      |",
-            "| 3  | 55      |",
-            "+----+---------+",
+            "+----+--------------+",
+            "| c1 | SUM(test.c2) |",
+            "+----+--------------+",
+            "| 0  | 55           |",
+            "| 1  | 55           |",
+            "| 2  | 55           |",
+            "| 3  | 55           |",
+            "+----+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1381,14 +1799,14 @@ mod tests {
         let results = execute("SELECT c1, AVG(c2) FROM test GROUP BY c1", 4).await?;
 
         let expected = vec![
-            "+----+---------+",
-            "| c1 | AVG(c2) |",
-            "+----+---------+",
-            "| 0  | 5.5     |",
-            "| 1  | 5.5     |",
-            "| 2  | 5.5     |",
-            "| 3  | 5.5     |",
-            "+----+---------+",
+            "+----+--------------+",
+            "| c1 | AVG(test.c2) |",
+            "+----+--------------+",
+            "| 0  | 5.5          |",
+            "| 1  | 5.5          |",
+            "| 2  | 5.5          |",
+            "| 3  | 5.5          |",
+            "+----+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1432,14 +1850,14 @@ mod tests {
         let results = execute("SELECT c1, MAX(c2) FROM test GROUP BY c1", 4).await?;
 
         let expected = vec![
-            "+----+---------+",
-            "| c1 | MAX(c2) |",
-            "+----+---------+",
-            "| 0  | 10      |",
-            "| 1  | 10      |",
-            "| 2  | 10      |",
-            "| 3  | 10      |",
-            "+----+---------+",
+            "+----+--------------+",
+            "| c1 | MAX(test.c2) |",
+            "+----+--------------+",
+            "| 0  | 10           |",
+            "| 1  | 10           |",
+            "| 2  | 10           |",
+            "| 3  | 10           |",
+            "+----+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1451,14 +1869,14 @@ mod tests {
         let results = execute("SELECT c1, MIN(c2) FROM test GROUP BY c1", 4).await?;
 
         let expected = vec![
-            "+----+---------+",
-            "| c1 | MIN(c2) |",
-            "+----+---------+",
-            "| 0  | 1       |",
-            "| 1  | 1       |",
-            "| 2  | 1       |",
-            "| 3  | 1       |",
-            "+----+---------+",
+            "+----+--------------+",
+            "| c1 | MIN(test.c2) |",
+            "+----+--------------+",
+            "| 0  | 1            |",
+            "| 1  | 1            |",
+            "| 2  | 1            |",
+            "| 3  | 1            |",
+            "+----+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1499,11 +1917,11 @@ mod tests {
         .unwrap();
 
         let expected = vec![
-            "+--------------+---------------+---------------+-------------+",
-            "| COUNT(nanos) | COUNT(micros) | COUNT(millis) | COUNT(secs) |",
-            "+--------------+---------------+---------------+-------------+",
-            "| 3            | 3             | 3             | 3           |",
-            "+--------------+---------------+---------------+-------------+",
+            "+----------------+-----------------+-----------------+---------------+",
+            "| COUNT(t.nanos) | COUNT(t.micros) | COUNT(t.millis) | COUNT(t.secs) |",
+            "+----------------+-----------------+-----------------+---------------+",
+            "| 3              | 3               | 3               | 3             |",
+            "+----------------+-----------------+-----------------+---------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1526,7 +1944,7 @@ mod tests {
 
         let expected = vec![
             "+----------------------------+----------------------------+-------------------------+---------------------+",
-            "| MIN(nanos)                 | MIN(micros)                | MIN(millis)             | MIN(secs)           |",
+            "| MIN(t.nanos)               | MIN(t.micros)              | MIN(t.millis)           | MIN(t.secs)         |",
             "+----------------------------+----------------------------+-------------------------+---------------------+",
             "| 2011-12-13 11:13:10.123450 | 2011-12-13 11:13:10.123450 | 2011-12-13 11:13:10.123 | 2011-12-13 11:13:10 |",
             "+----------------------------+----------------------------+-------------------------+---------------------+",
@@ -1552,7 +1970,7 @@ mod tests {
 
         let expected = vec![
             "+-------------------------+-------------------------+-------------------------+---------------------+",
-            "| MAX(nanos)              | MAX(micros)             | MAX(millis)             | MAX(secs)           |",
+            "| MAX(t.nanos)            | MAX(t.micros)           | MAX(t.millis)           | MAX(t.secs)         |",
             "+-------------------------+-------------------------+-------------------------+---------------------+",
             "| 2021-01-01 05:11:10.432 | 2021-01-01 05:11:10.432 | 2021-01-01 05:11:10.432 | 2021-01-01 05:11:10 |",
             "+-------------------------+-------------------------+-------------------------+---------------------+",
@@ -1603,11 +2021,11 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+-----------+-----------+",
-            "| COUNT(c1) | COUNT(c2) |",
-            "+-----------+-----------+",
-            "| 10        | 10        |",
-            "+-----------+-----------+",
+            "+----------------+----------------+",
+            "| COUNT(test.c1) | COUNT(test.c2) |",
+            "+----------------+----------------+",
+            "| 10             | 10             |",
+            "+----------------+----------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
         Ok(())
@@ -1619,11 +2037,11 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+-----------+-----------+",
-            "| COUNT(c1) | COUNT(c2) |",
-            "+-----------+-----------+",
-            "| 40        | 40        |",
-            "+-----------+-----------+",
+            "+----------------+----------------+",
+            "| COUNT(test.c1) | COUNT(test.c2) |",
+            "+----------------+----------------+",
+            "| 40             | 40             |",
+            "+----------------+----------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
         Ok(())
@@ -1634,14 +2052,14 @@ mod tests {
         let results = execute("SELECT c1, COUNT(c2) FROM test GROUP BY c1", 4).await?;
 
         let expected = vec![
-            "+----+-----------+",
-            "| c1 | COUNT(c2) |",
-            "+----+-----------+",
-            "| 0  | 10        |",
-            "| 1  | 10        |",
-            "| 2  | 10        |",
-            "| 3  | 10        |",
-            "+----+-----------+",
+            "+----+----------------+",
+            "| c1 | COUNT(test.c2) |",
+            "+----+----------------+",
+            "| 0  | 10             |",
+            "| 1  | 10             |",
+            "| 2  | 10             |",
+            "| 3  | 10             |",
+            "+----+----------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
         Ok(())
@@ -1685,12 +2103,12 @@ mod tests {
         ).await?;
 
         let expected = vec![
-            "+---------------------+---------+",
-            "| week                | SUM(c2) |",
-            "+---------------------+---------+",
-            "| 2020-12-07 00:00:00 | 24      |",
-            "| 2020-12-14 00:00:00 | 156     |",
-            "+---------------------+---------+",
+            "+---------------------+--------------+",
+            "| week                | SUM(test.c2) |",
+            "+---------------------+--------------+",
+            "| 2020-12-07 00:00:00 | 24           |",
+            "| 2020-12-14 00:00:00 | 156          |",
+            "+---------------------+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1736,13 +2154,13 @@ mod tests {
                     .expect("ran plan correctly");
 
             let expected = vec![
-                "+-----+------------+",
-                "| str | COUNT(val) |",
-                "+-----+------------+",
-                "| A   | 4          |",
-                "| B   | 1          |",
-                "| C   | 1          |",
-                "+-----+------------+",
+                "+-----+--------------+",
+                "| str | COUNT(t.val) |",
+                "+-----+--------------+",
+                "| A   | 4            |",
+                "| B   | 1            |",
+                "| C   | 1            |",
+                "+-----+--------------+",
             ];
             assert_batches_sorted_eq!(expected, &results);
         }
@@ -1787,13 +2205,13 @@ mod tests {
             .expect("ran plan correctly");
 
             let expected = vec![
-                "+------+------------+",
-                "| dict | COUNT(val) |",
-                "+------+------------+",
-                "| A    | 4          |",
-                "| B    | 1          |",
-                "| C    | 1          |",
-                "+------+------------+",
+                "+------+--------------+",
+                "| dict | COUNT(t.val) |",
+                "+------+--------------+",
+                "| A    | 4            |",
+                "| B    | 1            |",
+                "| C    | 1            |",
+                "+------+--------------+",
             ];
             assert_batches_sorted_eq!(expected, &results);
 
@@ -1804,13 +2222,13 @@ mod tests {
                     .expect("ran plan correctly");
 
             let expected = vec![
-                "+-----+-------------+",
-                "| val | COUNT(dict) |",
-                "+-----+-------------+",
-                "| 1   | 3           |",
-                "| 2   | 2           |",
-                "| 4   | 1           |",
-                "+-----+-------------+",
+                "+-----+---------------+",
+                "| val | COUNT(t.dict) |",
+                "+-----+---------------+",
+                "| 1   | 3             |",
+                "| 2   | 2             |",
+                "| 4   | 1             |",
+                "+-----+---------------+",
             ];
             assert_batches_sorted_eq!(expected, &results);
 
@@ -1823,13 +2241,13 @@ mod tests {
             .expect("ran plan correctly");
 
             let expected = vec![
-                "+-----+----------------------+",
-                "| val | COUNT(DISTINCT dict) |",
-                "+-----+----------------------+",
-                "| 1   | 2                    |",
-                "| 2   | 2                    |",
-                "| 4   | 1                    |",
-                "+-----+----------------------+",
+                "+-----+------------------------+",
+                "| val | COUNT(DISTINCT t.dict) |",
+                "+-----+------------------------+",
+                "| 1   | 2                      |",
+                "| 2   | 2                      |",
+                "| 4   | 1                      |",
+                "+-----+------------------------+",
             ];
             assert_batches_sorted_eq!(expected, &results);
         }
@@ -1928,13 +2346,13 @@ mod tests {
         let results = run_count_distinct_integers_aggregated_scenario(partitions).await?;
 
         let expected = vec![
-            "+---------+-----------------+------------------------+-------------------------+-------------------------+-------------------------+-------------------------+--------------------------+--------------------------+--------------------------+",
-            "| c_group | COUNT(c_uint64) | COUNT(DISTINCT c_int8) | COUNT(DISTINCT c_int16) | COUNT(DISTINCT c_int32) | COUNT(DISTINCT c_int64) | COUNT(DISTINCT c_uint8) | COUNT(DISTINCT c_uint16) | COUNT(DISTINCT c_uint32) | COUNT(DISTINCT c_uint64) |",
-            "+---------+-----------------+------------------------+-------------------------+-------------------------+-------------------------+-------------------------+--------------------------+--------------------------+--------------------------+",
-            "| a       | 3               | 2                      | 2                       | 2                       | 2                       | 2                       | 2                        | 2                        | 2                        |",
-            "| b       | 1               | 1                      | 1                       | 1                       | 1                       | 1                       | 1                        | 1                        | 1                        |",
-            "| c       | 3               | 2                      | 2                       | 2                       | 2                       | 2                       | 2                        | 2                        | 2                        |",
-            "+---------+-----------------+------------------------+-------------------------+-------------------------+-------------------------+-------------------------+--------------------------+--------------------------+--------------------------+",
+            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
+            "| c_group | COUNT(test.c_uint64) | COUNT(DISTINCT test.c_int8) | COUNT(DISTINCT test.c_int16) | COUNT(DISTINCT test.c_int32) | COUNT(DISTINCT test.c_int64) | COUNT(DISTINCT test.c_uint8) | COUNT(DISTINCT test.c_uint16) | COUNT(DISTINCT test.c_uint32) | COUNT(DISTINCT test.c_uint64) |",
+            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
+            "| a       | 3                    | 2                           | 2                            | 2                            | 2                            | 2                            | 2                             | 2                             | 2                             |",
+            "| b       | 1                    | 1                           | 1                            | 1                            | 1                            | 1                            | 1                             | 1                             | 1                             |",
+            "| c       | 3                    | 2                           | 2                            | 2                            | 2                            | 2                            | 2                             | 2                             | 2                             |",
+            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1954,13 +2372,13 @@ mod tests {
         let results = run_count_distinct_integers_aggregated_scenario(partitions).await?;
 
         let expected = vec![
-            "+---------+-----------------+------------------------+-------------------------+-------------------------+-------------------------+-------------------------+--------------------------+--------------------------+--------------------------+",
-            "| c_group | COUNT(c_uint64) | COUNT(DISTINCT c_int8) | COUNT(DISTINCT c_int16) | COUNT(DISTINCT c_int32) | COUNT(DISTINCT c_int64) | COUNT(DISTINCT c_uint8) | COUNT(DISTINCT c_uint16) | COUNT(DISTINCT c_uint32) | COUNT(DISTINCT c_uint64) |",
-            "+---------+-----------------+------------------------+-------------------------+-------------------------+-------------------------+-------------------------+--------------------------+--------------------------+--------------------------+",
-            "| a       | 5               | 3                      | 3                       | 3                       | 3                       | 3                       | 3                        | 3                        | 3                        |",
-            "| b       | 5               | 4                      | 4                       | 4                       | 4                       | 4                       | 4                        | 4                        | 4                        |",
-            "| c       | 1               | 1                      | 1                       | 1                       | 1                       | 1                       | 1                        | 1                        | 1                        |",
-            "+---------+-----------------+------------------------+-------------------------+-------------------------+-------------------------+-------------------------+--------------------------+--------------------------+--------------------------+",
+            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
+            "| c_group | COUNT(test.c_uint64) | COUNT(DISTINCT test.c_int8) | COUNT(DISTINCT test.c_int16) | COUNT(DISTINCT test.c_int32) | COUNT(DISTINCT test.c_int64) | COUNT(DISTINCT test.c_uint8) | COUNT(DISTINCT test.c_uint16) | COUNT(DISTINCT test.c_uint32) | COUNT(DISTINCT test.c_uint64) |",
+            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
+            "| a       | 5                    | 3                           | 3                            | 3                            | 3                            | 3                            | 3                             | 3                             | 3                             |",
+            "| b       | 5                    | 4                           | 4                            | 4                            | 4                            | 4                            | 4                             | 4                             | 4                             |",
+            "| c       | 1                    | 1                           | 1                            | 1                            | 1                            | 1                            | 1                             | 1                             | 1                             |",
+            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1977,9 +2395,9 @@ mod tests {
             Field::new("c2", DataType::UInt32, false),
         ]));
 
-        let plan = LogicalPlanBuilder::scan_empty("", schema.as_ref(), None)?
+        let plan = LogicalPlanBuilder::scan_empty(None, schema.as_ref(), None)?
             .aggregate(vec![col("c1")], vec![sum(col("c2"))])?
-            .project(vec![col("c1"), col("SUM(c2)").alias("total_salary")])?
+            .project(vec![col("c1"), sum(col("c2")).alias("total_salary")])?
             .build()?;
 
         let plan = ctx.optimize(&plan)?;
@@ -2075,11 +2493,11 @@ mod tests {
             .unwrap();
 
         let expected = vec![
-            "+---------+",
-            "| sqrt(i) |",
-            "+---------+",
-            "| 1       |",
-            "+---------+",
+            "+-----------+",
+            "| sqrt(t.i) |",
+            "+-----------+",
+            "| 1         |",
+            "+-----------+",
         ];
 
         let results = plan_and_collect(&mut ctx, "SELECT sqrt(i) FROM t")
@@ -2106,6 +2524,75 @@ mod tests {
             .await
             .unwrap();
         assert_batches_sorted_eq!(expected, &results);
+    }
+
+    #[tokio::test]
+    async fn case_builtin_math_expression() {
+        let mut ctx = ExecutionContext::new();
+
+        let type_values = vec![
+            (
+                DataType::Int8,
+                Arc::new(Int8Array::from(vec![1])) as ArrayRef,
+            ),
+            (
+                DataType::Int16,
+                Arc::new(Int16Array::from(vec![1])) as ArrayRef,
+            ),
+            (
+                DataType::Int32,
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            ),
+            (
+                DataType::Int64,
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            ),
+            (
+                DataType::UInt8,
+                Arc::new(UInt8Array::from(vec![1])) as ArrayRef,
+            ),
+            (
+                DataType::UInt16,
+                Arc::new(UInt16Array::from(vec![1])) as ArrayRef,
+            ),
+            (
+                DataType::UInt32,
+                Arc::new(UInt32Array::from(vec![1])) as ArrayRef,
+            ),
+            (
+                DataType::UInt64,
+                Arc::new(UInt64Array::from(vec![1])) as ArrayRef,
+            ),
+            (
+                DataType::Float32,
+                Arc::new(Float32Array::from(vec![1.0_f32])) as ArrayRef,
+            ),
+            (
+                DataType::Float64,
+                Arc::new(Float64Array::from(vec![1.0_f64])) as ArrayRef,
+            ),
+        ];
+
+        for (data_type, array) in type_values.iter() {
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("v", data_type.clone(), false)]));
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
+            let provider = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+            ctx.register_table("t", Arc::new(provider)).unwrap();
+            let expected = vec![
+                "+-----------+",
+                "| sqrt(t.v) |",
+                "+-----------+",
+                "| 1         |",
+                "+-----------+",
+            ];
+            let results = plan_and_collect(&mut ctx, "SELECT sqrt(v) FROM t")
+                .await
+                .unwrap();
+
+            assert_batches_sorted_eq!(expected, &results);
+        }
     }
 
     #[tokio::test]
@@ -2137,11 +2624,11 @@ mod tests {
         let result = plan_and_collect(&mut ctx, "SELECT \"MY_FUNC\"(i) FROM t").await?;
 
         let expected = vec![
-            "+------------+",
-            "| MY_FUNC(i) |",
-            "+------------+",
-            "| 1          |",
-            "+------------+",
+            "+--------------+",
+            "| MY_FUNC(t.i) |",
+            "+--------------+",
+            "| 1            |",
+            "+--------------+",
         ];
         assert_batches_eq!(expected, &result);
 
@@ -2155,11 +2642,11 @@ mod tests {
             .unwrap();
 
         let expected = vec![
-            "+--------+",
-            "| MAX(i) |",
-            "+--------+",
-            "| 1      |",
-            "+--------+",
+            "+----------+",
+            "| MAX(t.i) |",
+            "+----------+",
+            "| 1        |",
+            "+----------+",
         ];
 
         let results = plan_and_collect(&mut ctx, "SELECT max(i) FROM t")
@@ -2218,11 +2705,11 @@ mod tests {
         let result = plan_and_collect(&mut ctx, "SELECT \"MY_AVG\"(i) FROM t").await?;
 
         let expected = vec![
-            "+-----------+",
-            "| MY_AVG(i) |",
-            "+-----------+",
-            "| 1         |",
-            "+-----------+",
+            "+-------------+",
+            "| MY_AVG(t.i) |",
+            "+-------------+",
+            "| 1           |",
+            "+-------------+",
         ];
         assert_batches_eq!(expected, &result);
 
@@ -2318,11 +2805,11 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         let expected = vec![
-            "+---------+---------+-----------------+",
-            "| SUM(c1) | SUM(c2) | COUNT(UInt8(1)) |",
-            "+---------+---------+-----------------+",
-            "| 10      | 110     | 20              |",
-            "+---------+---------+-----------------+",
+            "+--------------+--------------+-----------------+",
+            "| SUM(test.c1) | SUM(test.c2) | COUNT(UInt8(1)) |",
+            "+--------------+--------------+-----------------+",
+            "| 10           | 110          | 20              |",
+            "+--------------+--------------+-----------------+",
         ];
         assert_batches_eq!(expected, &results);
 
@@ -2419,7 +2906,7 @@ mod tests {
 
         let t = ctx.table("t")?;
 
-        let plan = LogicalPlanBuilder::from(&t.to_logical_plan())
+        let plan = LogicalPlanBuilder::from(t.to_logical_plan())
             .project(vec![
                 col("a"),
                 col("b"),
@@ -2429,7 +2916,7 @@ mod tests {
 
         assert_eq!(
             format!("{:?}", plan),
-            "Projection: #a, #b, my_add(#a, #b)\n  TableScan: t projection=None"
+            "Projection: #t.a, #t.b, my_add(#t.a, #t.b)\n  TableScan: t projection=None"
         );
 
         let plan = ctx.optimize(&plan)?;
@@ -2437,14 +2924,14 @@ mod tests {
         let result = collect(plan).await?;
 
         let expected = vec![
-            "+-----+-----+-------------+",
-            "| a   | b   | my_add(a,b) |",
-            "+-----+-----+-------------+",
-            "| 1   | 2   | 3           |",
-            "| 10  | 12  | 22          |",
-            "| 10  | 12  | 22          |",
-            "| 100 | 120 | 220         |",
-            "+-----+-----+-------------+",
+            "+-----+-----+-----------------+",
+            "| a   | b   | my_add(t.a,t.b) |",
+            "+-----+-----+-----------------+",
+            "| 1   | 2   | 3               |",
+            "| 10  | 12  | 22              |",
+            "| 10  | 12  | 22              |",
+            "| 100 | 120 | 220             |",
+            "+-----+-----+-----------------+",
         ];
         assert_batches_eq!(expected, &result);
 
@@ -2547,11 +3034,11 @@ mod tests {
         let result = plan_and_collect(&mut ctx, "SELECT MY_AVG(a) FROM t").await?;
 
         let expected = vec![
-            "+-----------+",
-            "| my_avg(a) |",
-            "+-----------+",
-            "| 3         |",
-            "+-----------+",
+            "+-------------+",
+            "| my_avg(t.a) |",
+            "+-------------+",
+            "| 3           |",
+            "+-------------+",
         ];
         assert_batches_eq!(expected, &result);
 
@@ -2723,10 +3210,6 @@ mod tests {
                 _: &[Expr],
                 _: Option<usize>,
             ) -> Result<Arc<dyn ExecutionPlan>> {
-                unimplemented!()
-            }
-
-            fn statistics(&self) -> crate::datasource::datasource::Statistics {
                 unimplemented!()
             }
         }
@@ -3174,7 +3657,7 @@ mod tests {
             .expect("Executing CREATE EXTERNAL TABLE");
 
         let sql = "SELECT * from csv_with_timestamps";
-        let result = plan_and_collect(&mut ctx, &sql).await.unwrap();
+        let result = plan_and_collect(&mut ctx, sql).await.unwrap();
         let expected = vec![
             "+--------+-------------------------+",
             "| name   | ts                      |",
@@ -3184,6 +3667,42 @@ mod tests {
             "+--------+-------------------------+",
         ];
         assert_batches_sorted_eq!(expected, &result);
+    }
+
+    #[tokio::test]
+    async fn query_empty_table() {
+        let mut ctx = ExecutionContext::new();
+        let empty_table = Arc::new(EmptyTable::new(Arc::new(Schema::empty())));
+        ctx.register_table("test_tbl", empty_table).unwrap();
+        let sql = "SELECT * FROM test_tbl";
+        let result = plan_and_collect(&mut ctx, sql)
+            .await
+            .expect("Query empty table");
+        let expected = vec!["++", "++"];
+        assert_batches_sorted_eq!(expected, &result);
+    }
+
+    #[tokio::test]
+    async fn catalogs_not_leaked() {
+        // the information schema used to introduce cyclic Arcs
+        let ctx = ExecutionContext::with_config(
+            ExecutionConfig::new().with_information_schema(true),
+        );
+
+        // register a single catalog
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        let catalog_weak = Arc::downgrade(&catalog);
+        ctx.register_catalog("my_catalog", catalog);
+
+        let catalog_list_weak = {
+            let state = ctx.state.lock().unwrap();
+            Arc::downgrade(&state.catalog_list)
+        };
+
+        drop(ctx);
+
+        assert_eq!(Weak::strong_count(&catalog_list_weak), 0);
+        assert_eq!(Weak::strong_count(&catalog_weak), 0);
     }
 
     struct MyPhysicalPlanner {}
@@ -3197,6 +3716,16 @@ mod tests {
             Err(DataFusionError::NotImplemented(
                 "query not supported".to_string(),
             ))
+        }
+
+        fn create_physical_expr(
+            &self,
+            _expr: &Expr,
+            _input_dfschema: &crate::logical_plan::DFSchema,
+            _input_schema: &Schema,
+            _ctx_state: &ExecutionContextState,
+        ) -> Result<Arc<dyn crate::physical_plan::PhysicalExpr>> {
+            unimplemented!()
         }
     }
 
@@ -3285,8 +3814,9 @@ mod tests {
 
     /// Generate a partitioned CSV file and register it with an execution context
     fn create_ctx(tmp_dir: &TempDir, partition_count: usize) -> Result<ExecutionContext> {
-        let mut ctx =
-            ExecutionContext::with_config(ExecutionConfig::new().with_concurrency(8));
+        let mut ctx = ExecutionContext::with_config(
+            ExecutionConfig::new().with_target_partitions(8),
+        );
 
         let schema = populate_csv_partitions(tmp_dir, partition_count, ".csv")?;
 

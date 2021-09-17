@@ -76,7 +76,7 @@ use datafusion::{
     physical_plan::{
         planner::{DefaultPhysicalPlanner, ExtensionPlanner},
         DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PhysicalPlanner,
-        RecordBatchStream, SendableRecordBatchStream, LambdaExecPlan,
+        RecordBatchStream, SendableRecordBatchStream, Statistics, LambdaExecPlan,
     },
     prelude::{ExecutionConfig, ExecutionContext},
 };
@@ -165,9 +165,9 @@ async fn topk_plan() -> Result<()> {
     let mut ctx = setup_table(make_topk_context()).await?;
 
     let expected = vec![
-        "| logical_plan after topk                 | TopK: k=3                                                                            |",
-        "|                                         |   Projection: #customer_id, #revenue                                                 |",
-        "|                                         |     TableScan: sales projection=Some([0, 1])                                         |",
+        "| logical_plan after topk                    | TopK: k=3                                                                                |",
+        "|                                            |   Projection: #sales.customer_id, #sales.revenue                                         |",
+        "|                                            |     TableScan: sales projection=Some([0, 1])                                             |",
     ].join("\n");
 
     let explain_query = format!("EXPLAIN VERBOSE {}", QUERY);
@@ -176,14 +176,25 @@ async fn topk_plan() -> Result<()> {
     // normalize newlines (output on windows uses \r\n)
     let actual_output = actual_output.replace("\r\n", "\n");
 
-    assert!(actual_output.contains(&expected) , "Expected output not present in actual output\nExpected:\n---------\n{}\nActual:\n--------\n{}", expected, actual_output);
+    assert!(
+        actual_output.contains(&expected),
+        "Expected output not present in actual output\
+        \nExpected:\
+        \n---------\
+        \n{}\
+        \nActual:\
+        \n--------\
+        \n{}",
+        expected,
+        actual_output
+    );
     Ok(())
 }
 
 fn make_topk_context() -> ExecutionContext {
     let config = ExecutionConfig::new()
         .with_query_planner(Arc::new(TopKQueryPlanner {}))
-        .with_concurrency(48)
+        .with_target_partitions(48)
         .add_optimizer_rule(Arc::new(TopKOptimizerRule {}));
 
     ExecutionContext::with_config(config)
@@ -312,16 +323,19 @@ impl ExtensionPlanner for TopKPlanner {
     /// Create a physical plan for an extension node
     fn plan_extension(
         &self,
+        _planner: &dyn PhysicalPlanner,
         node: &dyn UserDefinedLogicalNode,
-        inputs: &[Arc<dyn ExecutionPlan>],
+        logical_inputs: &[&LogicalPlan],
+        physical_inputs: &[Arc<dyn ExecutionPlan>],
         _ctx_state: &ExecutionContextState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         Ok(
             if let Some(topk_node) = node.as_any().downcast_ref::<TopKPlanNode>() {
-                assert_eq!(inputs.len(), 1, "Inconsistent number of inputs");
+                assert_eq!(logical_inputs.len(), 1, "Inconsistent number of inputs");
+                assert_eq!(physical_inputs.len(), 1, "Inconsistent number of inputs");
                 // figure out input name
                 Some(Arc::new(TopKExec {
-                    input: inputs[0].clone(),
+                    input: physical_inputs[0].clone(),
                     k: topk_node.k,
                 }))
             } else {
@@ -419,6 +433,12 @@ impl ExecutionPlan for TopKExec {
                 write!(f, "TopKExec: k={}", self.k)
             }
         }
+    }
+
+    fn statistics(&self) -> Statistics {
+        // to improve the optimizability of this plan
+        // better statistics inference could be provided
+        Statistics::default()
     }
 }
 

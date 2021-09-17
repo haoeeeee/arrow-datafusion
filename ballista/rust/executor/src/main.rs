@@ -17,35 +17,24 @@
 
 //! Ballista Rust executor binary.
 
-use std::{
-    net::{IpAddr, Ipv4Addr},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arrow_flight::flight_service_server::FlightServiceServer;
-use futures::future::MaybeDone;
+use ballista_executor::execution_loop;
 use log::info;
 use tempfile::TempDir;
 use tonic::transport::Server;
 use uuid::Uuid;
 
-use ballista_core::{
-    client::BallistaClient,
-    serde::protobuf::{
-        executor_registration, scheduler_grpc_client::SchedulerGrpcClient,
-        ExecutorRegistration,
-    },
+use ballista_core::serde::protobuf::{
+    executor_registration, scheduler_grpc_client::SchedulerGrpcClient,
+    ExecutorRegistration,
 };
-use ballista_core::{
-    print_version, serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer,
-    BALLISTA_VERSION,
-};
+use ballista_core::{print_version, BALLISTA_VERSION};
+use ballista_executor::executor::Executor;
 use ballista_executor::flight_service::BallistaFlightService;
-use ballista_scheduler::{state::StandaloneClient, SchedulerServer};
 use config::prelude::*;
-
-mod execution_loop;
 
 #[macro_use]
 extern crate configure_me;
@@ -77,18 +66,14 @@ async fn main() -> Result<()> {
 
     let external_host = opt.external_host;
     let bind_host = opt.bind_host;
-    let port = opt.port;
+    let port = opt.bind_port;
 
     let addr = format!("{}:{}", bind_host, port);
     let addr = addr
         .parse()
         .with_context(|| format!("Could not parse address: {}", addr))?;
 
-    let scheduler_host = if opt.local {
-        "localhost".to_string()
-    } else {
-        opt.scheduler_host
-    };
+    let scheduler_host = opt.scheduler_host;
     let scheduler_port = opt.scheduler_port;
     let scheduler_url = format!("http://{}:{}", scheduler_host, scheduler_port);
 
@@ -111,62 +96,13 @@ async fn main() -> Result<()> {
         port: port as u32,
     };
 
-    if opt.local {
-        info!("Running in local mode. Scheduler will be run in-proc");
-
-        let client = match opt.scheduler_data_path {
-            Some(v) => StandaloneClient::try_new(v)
-                .context("Could not create standalone config backend")?,
-            None => StandaloneClient::try_new_temporary()
-                .context("Could not create standalone config backend")?,
-        };
-
-        let server = SchedulerGrpcServer::new(SchedulerServer::new(
-            Arc::new(client),
-            "ballista".to_string(),
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-        ));
-        let addr = format!("localhost:{}", scheduler_port);
-        let addr = addr
-            .parse()
-            .with_context(|| format!("Could not parse {}", addr))?;
-        info!(
-            "Ballista v{} Rust Scheduler listening on {:?}",
-            BALLISTA_VERSION, addr
-        );
-        let scheduler_future =
-            tokio::spawn(Server::builder().add_service(server).serve(addr));
-        let mut scheduler_result = futures::future::maybe_done(scheduler_future);
-
-        // Ensure scheduler is ready to receive connections
-        while SchedulerGrpcClient::connect(scheduler_url.clone())
-            .await
-            .is_err()
-        {
-            let scheduler_future = match scheduler_result {
-                MaybeDone::Future(f) => f,
-                MaybeDone::Done(Err(e)) => return Err(e).context("Tokio error"),
-                MaybeDone::Done(Ok(Err(e))) => {
-                    return Err(e).context("Scheduler failed to initialize correctly")
-                }
-                MaybeDone::Done(Ok(Ok(()))) => {
-                    return Err(anyhow::format_err!(
-                        "Scheduler unexpectedly finished successfully"
-                    ))
-                }
-                MaybeDone::Gone => {
-                    panic!("Received Gone from recently created MaybeDone")
-                }
-            };
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            scheduler_result = futures::future::maybe_done(scheduler_future);
-        }
-    }
-
     let scheduler = SchedulerGrpcClient::connect(scheduler_url)
         .await
         .context("Could not connect to scheduler")?;
-    let service = BallistaFlightService::new(work_dir);
+
+    let executor = Arc::new(Executor::new(&work_dir));
+
+    let service = BallistaFlightService::new(executor.clone());
 
     let server = FlightServiceServer::new(service);
     info!(
@@ -174,19 +110,9 @@ async fn main() -> Result<()> {
         BALLISTA_VERSION, addr
     );
     let server_future = tokio::spawn(Server::builder().add_service(server).serve(addr));
-    let client_host = external_host.as_deref().unwrap_or_else(|| {
-        if bind_host == "0.0.0.0" {
-            // If the executor is being bound to "0.0.0.0" (which means use all ips in all eth devices)
-            // then use "localhost" to connect to itself through the BallistaClient
-            "localhost"
-        } else {
-            &bind_host
-        }
-    });
-    let client = BallistaClient::try_new(client_host, port).await?;
     tokio::spawn(execution_loop::poll_loop(
         scheduler,
-        client,
+        executor,
         executor_meta,
         opt.concurrent_tasks,
     ));

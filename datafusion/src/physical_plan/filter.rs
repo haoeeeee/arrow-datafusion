@@ -23,11 +23,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use super::{RecordBatchStream, SendableRecordBatchStream};
+use super::{RecordBatchStream, SendableRecordBatchStream, Statistics};
 use crate::error::{DataFusionError, Result};
 use crate::physical_plan::memory::MemoryExec;
 use crate::physical_plan::{
-    DisplayFormatType, ExecutionPlan, LambdaExecPlan, Partitioning, PhysicalExpr,
+    metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
+    DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr,
+    LambdaExecPlan,
 };
 use arrow::array::BooleanArray;
 use arrow::compute::filter_record_batch;
@@ -49,6 +51,8 @@ pub struct FilterExec {
     predicate: Arc<dyn PhysicalExpr>,
     /// The input plan
     input: Arc<dyn ExecutionPlan>,
+    /// Execution metrics
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl FilterExec {
@@ -61,6 +65,7 @@ impl FilterExec {
             DataType::Boolean => Ok(Self {
                 predicate,
                 input: input.clone(),
+                metrics: ExecutionPlanMetricsSet::new(),
             }),
             other => Err(DataFusionError::Plan(format!(
                 "Filter predicate must return boolean values, not {:?}",
@@ -79,6 +84,7 @@ impl FilterExec {
         Arc::new(FilterExec {
             input: Arc::new(memory_exec),
             predicate: self.predicate.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
@@ -98,6 +104,7 @@ impl LambdaExecPlan for FilterExec {
     fn feed_batches(&mut self, partitions: Vec<Vec<RecordBatch>>) {
         self.input = Arc::new(MemoryExec {
             partitions,
+            projected_schema: self.schema(),
             schema: self.schema(),
             projection: None,
         });
@@ -147,10 +154,13 @@ impl ExecutionPlan for FilterExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream> {
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+
         Ok(Box::pin(FilterExecStream {
             schema: self.input.schema().clone(),
             predicate: self.predicate.clone(),
             input: self.input.execute(partition).await?,
+            baseline_metrics,
         }))
     }
 
@@ -165,6 +175,15 @@ impl ExecutionPlan for FilterExec {
             }
         }
     }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    /// The output statistics of a filtering operation are unknown
+    fn statistics(&self) -> Statistics {
+        Statistics::default()
+    }
 }
 
 /// The FilterExec streams wraps the input iterator and applies the predicate expression to
@@ -176,6 +195,8 @@ struct FilterExecStream {
     predicate: Arc<dyn PhysicalExpr>,
     /// The input partition to filter.
     input: SendableRecordBatchStream,
+    /// runtime metrics recording
+    baseline_metrics: BaselineMetrics,
 }
 
 fn batch_filter(
@@ -183,7 +204,7 @@ fn batch_filter(
     predicate: &Arc<dyn PhysicalExpr>,
 ) -> ArrowResult<RecordBatch> {
     predicate
-        .evaluate(&batch)
+        .evaluate(batch)
         .map(|v| v.into_array(batch.num_rows()))
         .map_err(DataFusionError::into_arrow_external_error)
         .and_then(|array| {
@@ -208,10 +229,16 @@ impl Stream for FilterExecStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        self.input.poll_next_unpin(cx).map(|x| match x {
-            Some(Ok(batch)) => Some(batch_filter(&batch, &self.predicate)),
+        let poll = self.input.poll_next_unpin(cx).map(|x| match x {
+            Some(Ok(batch)) => {
+                let timer = self.baseline_metrics.elapsed_compute().timer();
+                let filtered_batch = batch_filter(&batch, &self.predicate);
+                timer.done();
+                Some(filtered_batch)
+            }
             other => other,
-        })
+        });
+        self.baseline_metrics.record_poll(poll)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -255,14 +282,14 @@ mod tests {
 
         let predicate: Arc<dyn PhysicalExpr> = binary(
             binary(
-                col("c2"),
+                col("c2", &schema)?,
                 Operator::Gt,
                 lit(ScalarValue::from(1u32)),
                 &schema,
             )?,
             Operator::And,
             binary(
-                col("c2"),
+                col("c2", &schema)?,
                 Operator::Lt,
                 lit(ScalarValue::from(4u32)),
                 &schema,

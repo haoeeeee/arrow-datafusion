@@ -17,25 +17,31 @@
 
 //! Traits for physical query plan, supporting parallel execution for partitioned relations.
 
-use std::fmt::{self, Debug, Display};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::{any::Any, pin::Pin};
-
-use crate::execution::context::ExecutionContextState;
-use crate::logical_plan::LogicalPlan;
-use crate::{error::Result, scalar::ScalarValue};
+pub use self::metrics::Metric;
+use self::metrics::MetricsSet;
+use self::{
+    coalesce_partitions::CoalescePartitionsExec, display::DisplayableExecutionPlan,
+};
+use crate::physical_plan::expressions::PhysicalSortExpr;
+use crate::{
+    error::{DataFusionError, Result},
+    scalar::ScalarValue,
+};
+use arrow::compute::kernels::partition::lexicographical_partition_ranges;
+use arrow::compute::kernels::sort::{SortColumn, SortOptions};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
 use arrow::{array::ArrayRef, datatypes::Field};
-
 use async_trait::async_trait;
 pub use display::DisplayFormatType;
 use futures::stream::Stream;
-
-use self::{display::DisplayableExecutionPlan, merge::MergeExec};
-use hashbrown::HashMap;
+use std::fmt;
+use std::fmt::{Debug, Display};
+use std::ops::Range;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::{any::Any, pin::Pin};
 
 use serde::{Deserialize, Serialize};
 
@@ -51,76 +57,68 @@ pub trait RecordBatchStream: Stream<Item = ArrowResult<RecordBatch>> {
 /// Trait for a stream of record batches.
 pub type SendableRecordBatchStream = Pin<Box<dyn RecordBatchStream + Send + Sync>>;
 
-/// SQL metric type
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum MetricType {
-    /// Simple counter
-    Counter,
-    /// Wall clock time in nanoseconds
-    TimeNanos,
+/// EmptyRecordBatchStream can be used to create a RecordBatchStream
+/// that will produce no results
+pub struct EmptyRecordBatchStream {
+    /// Schema
+    schema: SchemaRef,
 }
 
-/// SQL metric such as counter (number of input or output rows) or timing information about
-/// a physical operator.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SQLMetric {
-    /// Metric value
-    value: AtomicUsize,
-    /// Metric type
-    metric_type: MetricType,
-}
-
-impl Clone for SQLMetric {
-    fn clone(&self) -> Self {
-        Self {
-            value: AtomicUsize::new(self.value.load(Ordering::Relaxed)),
-            metric_type: self.metric_type.clone(),
-        }
+impl EmptyRecordBatchStream {
+    /// Create an empty RecordBatchStream
+    pub fn new(schema: SchemaRef) -> Self {
+        Self { schema }
     }
 }
 
-impl SQLMetric {
-    // relaxed ordering for operations on `value` poses no issues
-    // we're purely using atomic ops with no associated memory ops
-
-    /// Create a new metric for tracking a counter
-    pub fn counter() -> Arc<SQLMetric> {
-        Arc::new(SQLMetric::new(MetricType::Counter))
-    }
-
-    /// Create a new metric for tracking time in nanoseconds
-    pub fn time_nanos() -> Arc<SQLMetric> {
-        Arc::new(SQLMetric::new(MetricType::TimeNanos))
-    }
-
-    /// Create a new SQLMetric
-    pub fn new(metric_type: MetricType) -> Self {
-        Self {
-            value: AtomicUsize::new(0),
-            metric_type,
-        }
-    }
-
-    /// Add to the value
-    pub fn add(&self, n: usize) {
-        self.value.fetch_add(n, Ordering::Relaxed);
-    }
-
-    /// Get the current value
-    pub fn value(&self) -> usize {
-        self.value.load(Ordering::Relaxed)
+impl RecordBatchStream for EmptyRecordBatchStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 }
 
-/// Physical query planner that converts a `LogicalPlan` to an
-/// `ExecutionPlan` suitable for execution.
-pub trait PhysicalPlanner {
-    /// Create a physical plan from a logical plan
-    fn create_physical_plan(
-        &self,
-        logical_plan: &LogicalPlan,
-        ctx_state: &ExecutionContextState,
-    ) -> Result<Arc<dyn ExecutionPlan>>;
+impl Stream for EmptyRecordBatchStream {
+    type Item = ArrowResult<RecordBatch>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        Poll::Ready(None)
+    }
+}
+
+/// Physical planner interface
+pub use self::planner::PhysicalPlanner;
+
+/// Statistics for a physical plan node
+/// Fields are optional and can be inexact because the sources
+/// sometimes provide approximate estimates for performance reasons
+/// and the transformations output are not always predictable.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct Statistics {
+    /// The number of table rows
+    pub num_rows: Option<usize>,
+    /// total byte of the table rows
+    pub total_byte_size: Option<usize>,
+    /// Statistics on a column level
+    pub column_statistics: Option<Vec<ColumnStatistics>>,
+    /// If true, any field that is `Some(..)` is the actual value in the data provided by the operator (it is not
+    /// an estimate). Any or all other fields might still be None, in which case no information is known.  
+    /// if false, any field that is `Some(..)` may contain an inexact estimate and may not be the actual value.
+    pub is_exact: bool,
+}
+/// This table statistics are estimates about column
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ColumnStatistics {
+    /// Number of null values on column
+    pub null_count: Option<usize>,
+    /// Maximum value of column
+    pub max_value: Option<ScalarValue>,
+    /// Minimum value of column
+    pub min_value: Option<ScalarValue>,
+    /// Number of distinct values
+    pub distinct_count: Option<usize>,
 }
 
 /// `ExecutionPlan` represent nodes in the DataFusion Physical Plan.
@@ -163,9 +161,19 @@ pub trait ExecutionPlan: Debug + Send + Sync + LambdaExecPlan {
     /// creates an iterator
     async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream>;
 
-    /// Return a snapshot of the metrics collected during execution
-    fn metrics(&self) -> HashMap<String, SQLMetric> {
-        HashMap::new()
+    /// Return a snapshot of the set of [`Metric`]s for this
+    /// [`ExecutionPlan`].
+    ///
+    /// While the values of the metrics in the returned
+    /// [`MetricsSet`]s may change as execution progresses, the
+    /// specific metrics will not.
+    ///
+    /// Once `self.execute()` has returned (technically the future is
+    /// resolved) for all available partitions, the set of metrics
+    /// should be complete. If this function is called prior to
+    /// `execute()` new metrics may appear in subsequent calls.
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
     }
 
     /// Format this `ExecutionPlan` to `f` in the specified type.
@@ -177,6 +185,9 @@ pub trait ExecutionPlan: Debug + Send + Sync + LambdaExecPlan {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "ExecutionPlan(PlaceHolder)")
     }
+
+    /// Returns the global output statistics for this `ExecutionPlan` node.
+    fn statistics(&self) -> Statistics;
 }
 
 /// Partition-aware execution plan for a relation on AWS Lambda
@@ -193,9 +204,9 @@ pub trait LambdaExecPlan: Debug + Send + Sync {
 /// use datafusion::prelude::*;
 /// use datafusion::physical_plan::displayable;
 ///
-/// // Hard code concurrency as it appears in the RepartitionExec output
+/// // Hard code target_partitions as it appears in the RepartitionExec output
 /// let config = ExecutionConfig::new()
-///     .with_concurrency(3);
+///     .with_target_partitions(3);
 /// let mut ctx = ExecutionContext::with_config(config);
 ///
 /// // register the a table
@@ -212,9 +223,9 @@ pub trait LambdaExecPlan: Debug + Send + Sync {
 /// let displayable_plan = displayable(physical_plan.as_ref());
 /// let plan_string = format!("{}", displayable_plan.indent());
 ///
-/// assert_eq!("ProjectionExec: expr=[a]\
+/// assert_eq!("ProjectionExec: expr=[a@0 as a]\
 ///            \n  CoalesceBatchesExec: target_batch_size=4096\
-///            \n    FilterExec: a < 5\
+///            \n    FilterExec: a@0 < 5\
 ///            \n      RepartitionExec: partitioning=RoundRobinBatch(3)\
 ///            \n        CsvExec: source=Path(tests/example.csv: [tests/example.csv]), has_header=true",
 ///             plan_string.trim());
@@ -308,18 +319,23 @@ pub fn visit_execution_plan<V: ExecutionPlanVisitor>(
 
 /// Execute the [ExecutionPlan] and collect the results in memory
 pub async fn collect(plan: Arc<dyn ExecutionPlan>) -> Result<Vec<RecordBatch>> {
+    let stream = execute_stream(plan).await?;
+    common::collect(stream).await
+}
+
+/// Execute the [ExecutionPlan] and return a single stream of results
+pub async fn execute_stream(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<SendableRecordBatchStream> {
     match plan.output_partitioning().partition_count() {
-        0 => Ok(vec![]),
-        1 => {
-            let it = plan.execute(0).await?;
-            common::collect(it).await
-        }
+        0 => Ok(Box::pin(EmptyRecordBatchStream::new(plan.schema()))),
+        1 => plan.execute(0).await,
         _ => {
             // merge into a single partition
-            let plan = MergeExec::new(plan.clone());
-            // MergeExec must produce a single partition
+            let plan = CoalescePartitionsExec::new(plan.clone());
+            // CoalescePartitionsExec must produce a single partition
             assert_eq!(1, plan.output_partitioning().partition_count());
-            common::collect(plan.execute(0).await?).await
+            plan.execute(0).await
         }
     }
 }
@@ -328,20 +344,24 @@ pub async fn collect(plan: Arc<dyn ExecutionPlan>) -> Result<Vec<RecordBatch>> {
 pub async fn collect_partitioned(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Vec<Vec<RecordBatch>>> {
-    match plan.output_partitioning().partition_count() {
-        0 => Ok(vec![]),
-        1 => {
-            let it = plan.execute(0).await?;
-            Ok(vec![common::collect(it).await?])
-        }
-        _ => {
-            let mut partitions = vec![];
-            for i in 0..plan.output_partitioning().partition_count() {
-                partitions.push(common::collect(plan.execute(i).await?).await?)
-            }
-            Ok(partitions)
-        }
+    let streams = execute_stream_partitioned(plan).await?;
+    let mut batches = Vec::with_capacity(streams.len());
+    for stream in streams {
+        batches.push(common::collect(stream).await?);
     }
+    Ok(batches)
+}
+
+/// Execute the [ExecutionPlan] and return a vec with one stream per output partition
+pub async fn execute_stream_partitioned(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Vec<SendableRecordBatchStream>> {
+    let num_partitions = plan.output_partitioning().partition_count();
+    let mut streams = Vec::with_capacity(num_partitions);
+    for i in 0..num_partitions {
+        streams.push(plan.execute(i).await?);
+    }
+    Ok(streams)
 }
 
 /// Partitioning schemes supported by operators.
@@ -349,9 +369,8 @@ pub async fn collect_partitioned(
 pub enum Partitioning {
     /// Allocate batches using a round-robin algorithm and the specified number of partitions
     RoundRobinBatch(usize),
-    /// Allocate rows based on a hash of one of more expressions and the specified
-    /// number of partitions
-    /// This partitioning scheme is not yet fully supported. See [ARROW-11011](https://issues.apache.org/jira/browse/ARROW-11011)
+    /// Allocate rows based on a hash of one of more expressions and the specified number of
+    /// partitions
     Hash(Vec<Arc<dyn PhysicalExpr>>, usize),
     /// Use to handle `Partition By` clause.
     HashDiff(Vec<Arc<dyn PhysicalExpr>>, usize),
@@ -401,7 +420,8 @@ impl ColumnarValue {
         }
     }
 
-    fn into_array(self, num_rows: usize) -> ArrayRef {
+    /// Convert a columnar value into an ArrayRef
+    pub fn into_array(self, num_rows: usize) -> ArrayRef {
         match self {
             ColumnarValue::Array(array) => array,
             ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(num_rows),
@@ -458,8 +478,97 @@ pub trait AggregateExpr: Send + Sync + Debug {
     }
 }
 
+/// A window expression that:
+/// * knows its resulting field
+#[typetag::serde(tag = "window_expr")]
+pub trait WindowExpr: Send + Sync + Debug {
+    /// Returns the window expression as [`Any`](std::any::Any) so that it can be
+    /// downcast to a specific implementation.
+    fn as_any(&self) -> &dyn Any;
+
+    /// the field of the final result of this window function.
+    fn field(&self) -> Result<Field>;
+
+    /// Human readable name such as `"MIN(c2)"` or `"RANK()"`. The default
+    /// implementation returns placeholder text.
+    fn name(&self) -> &str {
+        "WindowExpr: default name"
+    }
+
+    /// expressions that are passed to the WindowAccumulator.
+    /// Functions which take a single input argument, such as `sum`, return a single [`Expr`],
+    /// others (e.g. `cov`) return many.
+    fn expressions(&self) -> Vec<Arc<dyn PhysicalExpr>>;
+
+    /// evaluate the window function arguments against the batch and return
+    /// array ref, normally the resulting vec is a single element one.
+    fn evaluate_args(&self, batch: &RecordBatch) -> Result<Vec<ArrayRef>> {
+        self.expressions()
+            .iter()
+            .map(|e| e.evaluate(batch))
+            .map(|r| r.map(|v| v.into_array(batch.num_rows())))
+            .collect()
+    }
+
+    /// evaluate the window function values against the batch
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef>;
+
+    /// evaluate the partition points given the sort columns; if the sort columns are
+    /// empty then the result will be a single element vec of the whole column rows.
+    fn evaluate_partition_points(
+        &self,
+        num_rows: usize,
+        partition_columns: &[SortColumn],
+    ) -> Result<Vec<Range<usize>>> {
+        if partition_columns.is_empty() {
+            Ok(vec![Range {
+                start: 0,
+                end: num_rows,
+            }])
+        } else {
+            Ok(lexicographical_partition_ranges(partition_columns)
+                .map_err(DataFusionError::ArrowError)?
+                .collect::<Vec<_>>())
+        }
+    }
+
+    /// expressions that's from the window function's partition by clause, empty if absent
+    fn partition_by(&self) -> &[Arc<dyn PhysicalExpr>];
+
+    /// expressions that's from the window function's order by clause, empty if absent
+    fn order_by(&self) -> &[PhysicalSortExpr];
+
+    /// get partition columns that can be used for partitioning, empty if absent
+    fn partition_columns(&self, batch: &RecordBatch) -> Result<Vec<SortColumn>> {
+        self.partition_by()
+            .iter()
+            .map(|expr| {
+                PhysicalSortExpr {
+                    expr: expr.clone(),
+                    options: SortOptions::default(),
+                }
+                .evaluate_to_sort_column(batch)
+            })
+            .collect()
+    }
+
+    /// get sort columns that can be used for peer evaluation, empty if absent
+    fn sort_columns(&self, batch: &RecordBatch) -> Result<Vec<SortColumn>> {
+        let mut sort_columns = self.partition_columns(batch)?;
+        let order_by_columns = self
+            .order_by()
+            .iter()
+            .map(|e| e.evaluate_to_sort_column(batch))
+            .collect::<Result<Vec<SortColumn>>>()?;
+        sort_columns.extend(order_by_columns);
+        Ok(sort_columns)
+    }
+}
+
 /// An accumulator represents a stateful object that lives throughout the evaluation of multiple rows and
-/// generically accumulates values. An accumulator knows how to:
+/// generically accumulates values.
+///
+/// An accumulator knows how to:
 /// * update its state from inputs via `update`
 /// * convert its internal state to a vector of scalar values
 /// * update its state from multiple accumulators' states via `merge`
@@ -509,8 +618,11 @@ pub trait Accumulator: Send + Sync + Debug {
 }
 
 pub mod aggregates;
+pub mod analyze;
 pub mod array_expressions;
+pub mod avro;
 pub mod coalesce_batches;
+pub mod coalesce_partitions;
 pub mod common;
 pub mod cross_join;
 #[cfg(feature = "crypto_expressions")]
@@ -524,14 +636,14 @@ pub mod explain;
 pub mod expressions;
 pub mod filter;
 pub mod functions;
-pub mod group_scalar;
 pub mod hash_aggregate;
 pub mod hash_join;
 pub mod hash_utils;
+pub mod json;
 pub mod limit;
 pub mod math_expressions;
 pub mod memory;
-pub mod merge;
+pub mod metrics;
 pub mod parquet;
 pub mod planner;
 pub mod projection;
@@ -539,6 +651,9 @@ pub mod projection;
 pub mod regex_expressions;
 pub mod repartition;
 pub mod sort;
+pub mod sort_preserving_merge;
+pub mod source;
+pub mod stream;
 pub mod string_expressions;
 pub mod type_coercion;
 pub mod udaf;
@@ -546,3 +661,5 @@ pub mod udf;
 #[cfg(feature = "unicode_expressions")]
 pub mod unicode_expressions;
 pub mod union;
+pub mod window_functions;
+pub mod windows;

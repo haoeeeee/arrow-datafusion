@@ -17,15 +17,11 @@
 
 //! Collection of utility functions that are leveraged by the query optimizer rules
 
-use std::{collections::HashSet, sync::Arc};
-
-use arrow::datatypes::Schema;
-
 use super::optimizer::OptimizerRule;
 use crate::execution::context::ExecutionProps;
 use crate::logical_plan::{
-    Expr, LogicalPlan, Operator, Partitioning, PlanType, Recursion, StringifiedPlan,
-    ToDFSchema,
+    build_join_schema, Column, DFSchemaRef, Expr, LogicalPlan, LogicalPlanBuilder,
+    Operator, Partitioning, Recursion,
 };
 use crate::prelude::lit;
 use crate::scalar::ScalarValue;
@@ -33,18 +29,18 @@ use crate::{
     error::{DataFusionError, Result},
     logical_plan::ExpressionVisitor,
 };
+use std::{collections::HashSet, sync::Arc};
 
 const CASE_EXPR_MARKER: &str = "__DATAFUSION_CASE_EXPR__";
 const CASE_ELSE_MARKER: &str = "__DATAFUSION_CASE_ELSE__";
+const WINDOW_PARTITION_MARKER: &str = "__DATAFUSION_WINDOW_PARTITION__";
+const WINDOW_SORT_MARKER: &str = "__DATAFUSION_WINDOW_SORT__";
 
-/// Recursively walk a list of expression trees, collecting the unique set of column
-/// names referenced in the expression
-pub fn exprlist_to_column_names(
-    expr: &[Expr],
-    accum: &mut HashSet<String>,
-) -> Result<()> {
+/// Recursively walk a list of expression trees, collecting the unique set of columns
+/// referenced in the expression
+pub fn exprlist_to_columns(expr: &[Expr], accum: &mut HashSet<Column>) -> Result<()> {
     for e in expr {
-        expr_to_column_names(e, accum)?;
+        expr_to_columns(e, accum)?;
     }
     Ok(())
 }
@@ -52,17 +48,17 @@ pub fn exprlist_to_column_names(
 /// Recursively walk an expression tree, collecting the unique set of column names
 /// referenced in the expression
 struct ColumnNameVisitor<'a> {
-    accum: &'a mut HashSet<String>,
+    accum: &'a mut HashSet<Column>,
 }
 
 impl ExpressionVisitor for ColumnNameVisitor<'_> {
     fn pre_visit(self, expr: &Expr) -> Result<Recursion<Self>> {
         match expr {
-            Expr::Column(name) => {
-                self.accum.insert(name.clone());
+            Expr::Column(qc) => {
+                self.accum.insert(qc.clone());
             }
             Expr::ScalarVariable(var_names) => {
-                self.accum.insert(var_names.join("."));
+                self.accum.insert(Column::from_name(var_names.join(".")));
             }
             Expr::Alias(_, _) => {}
             Expr::Literal(_) => {}
@@ -78,6 +74,7 @@ impl ExpressionVisitor for ColumnNameVisitor<'_> {
             Expr::Sort { .. } => {}
             Expr::ScalarFunction { .. } => {}
             Expr::ScalarUDF { .. } => {}
+            Expr::WindowFunction { .. } => {}
             Expr::AggregateFunction { .. } => {}
             Expr::AggregateUDF { .. } => {}
             Expr::InList { .. } => {}
@@ -87,39 +84,11 @@ impl ExpressionVisitor for ColumnNameVisitor<'_> {
     }
 }
 
-/// Recursively walk an expression tree, collecting the unique set of column names
+/// Recursively walk an expression tree, collecting the unique set of columns
 /// referenced in the expression
-pub fn expr_to_column_names(expr: &Expr, accum: &mut HashSet<String>) -> Result<()> {
+pub fn expr_to_columns(expr: &Expr, accum: &mut HashSet<Column>) -> Result<()> {
     expr.accept(ColumnNameVisitor { accum })?;
     Ok(())
-}
-
-/// Create a `LogicalPlan::Explain` node by running `optimizer` on the
-/// input plan and capturing the resulting plan string
-pub fn optimize_explain(
-    optimizer: &impl OptimizerRule,
-    verbose: bool,
-    plan: &LogicalPlan,
-    stringified_plans: &[StringifiedPlan],
-    schema: &Schema,
-    execution_props: &ExecutionProps,
-) -> Result<LogicalPlan> {
-    // These are the fields of LogicalPlan::Explain It might be nice
-    // to transform that enum Variant into its own struct and avoid
-    // passing the fields individually
-    let plan = Arc::new(optimizer.optimize(plan, execution_props)?);
-    let mut stringified_plans = stringified_plans.to_vec();
-    let optimizer_name = optimizer.name().into();
-    stringified_plans.push(StringifiedPlan::new(
-        PlanType::OptimizedLogicalPlan { optimizer_name },
-        format!("{:#?}", plan),
-    ));
-    Ok(LogicalPlan::Explain {
-        verbose,
-        plan,
-        stringified_plans,
-        schema: schema.clone().to_dfschema_ref()?,
-    })
 }
 
 /// Convenience rule for writing optimizers: recursively invoke
@@ -132,23 +101,6 @@ pub fn optimize_children(
     plan: &LogicalPlan,
     execution_props: &ExecutionProps,
 ) -> Result<LogicalPlan> {
-    if let LogicalPlan::Explain {
-        verbose,
-        plan,
-        stringified_plans,
-        schema,
-    } = plan
-    {
-        return optimize_explain(
-            optimizer,
-            *verbose,
-            &*plan,
-            stringified_plans,
-            &schema.as_ref().to_owned().into(),
-            execution_props,
-        );
-    }
-
     let new_exprs = plan.expressions();
     let new_inputs = plan
         .inputs()
@@ -188,6 +140,15 @@ pub fn from_plan(
                 input: Arc::new(inputs[0].clone()),
             }),
         },
+        LogicalPlan::Window {
+            window_expr,
+            schema,
+            ..
+        } => Ok(LogicalPlan::Window {
+            input: Arc::new(inputs[0].clone()),
+            window_expr: expr[0..window_expr.len()].to_vec(),
+            schema: schema.clone(),
+        }),
         LogicalPlan::Aggregate {
             group_expr, schema, ..
         } => Ok(LogicalPlan::Aggregate {
@@ -202,21 +163,26 @@ pub fn from_plan(
         }),
         LogicalPlan::Join {
             join_type,
+            join_constraint,
             on,
-            schema,
             ..
-        } => Ok(LogicalPlan::Join {
-            left: Arc::new(inputs[0].clone()),
-            right: Arc::new(inputs[1].clone()),
-            join_type: *join_type,
-            on: on.clone(),
-            schema: schema.clone(),
-        }),
-        LogicalPlan::CrossJoin { schema, .. } => Ok(LogicalPlan::CrossJoin {
-            left: Arc::new(inputs[0].clone()),
-            right: Arc::new(inputs[1].clone()),
-            schema: schema.clone(),
-        }),
+        } => {
+            let schema =
+                build_join_schema(inputs[0].schema(), inputs[1].schema(), join_type)?;
+            Ok(LogicalPlan::Join {
+                left: Arc::new(inputs[0].clone()),
+                right: Arc::new(inputs[1].clone()),
+                join_type: *join_type,
+                join_constraint: *join_constraint,
+                on: on.clone(),
+                schema: DFSchemaRef::new(schema),
+            })
+        }
+        LogicalPlan::CrossJoin { .. } => {
+            let left = inputs[0].clone();
+            let right = &inputs[1];
+            LogicalPlanBuilder::from(left).cross_join(right)?.build()
+        }
         LogicalPlan::Limit { n, .. } => Ok(LogicalPlan::Limit {
             n: *n,
             input: Arc::new(inputs[0].clone()),
@@ -229,10 +195,39 @@ pub fn from_plan(
             schema: schema.clone(),
             alias: alias.clone(),
         }),
+        LogicalPlan::Analyze {
+            verbose, schema, ..
+        } => {
+            assert!(expr.is_empty());
+            assert_eq!(inputs.len(), 1);
+            Ok(LogicalPlan::Analyze {
+                verbose: *verbose,
+                schema: schema.clone(),
+                input: Arc::new(inputs[0].clone()),
+            })
+        }
+        LogicalPlan::Explain { .. } => {
+            // Explain should be handled specially in the optimizers;
+            // If this assert fails it means some optimizer pass is
+            // trying to optimize Explain directly
+            assert!(
+                expr.is_empty(),
+                "Explain can not be created from utils::from_expr"
+            );
+            assert!(
+                inputs.is_empty(),
+                "Explain can not be created from utils::from_expr"
+            );
+            Ok(plan.clone())
+        }
         LogicalPlan::EmptyRelation { .. }
         | LogicalPlan::TableScan { .. }
-        | LogicalPlan::CreateExternalTable { .. }
-        | LogicalPlan::Explain { .. } => Ok(plan.clone()),
+        | LogicalPlan::CreateExternalTable { .. } => {
+            // All of these plan types have no inputs / exprs so should not be called
+            assert!(expr.is_empty(), "{:?} should have no exprs", plan);
+            assert!(inputs.is_empty(), "{:?}  should have no inputs", plan);
+            Ok(plan.clone())
+        }
     }
 }
 
@@ -247,6 +242,20 @@ pub fn expr_sub_expressions(expr: &Expr) -> Result<Vec<Expr>> {
         Expr::IsNotNull(e) => Ok(vec![e.as_ref().to_owned()]),
         Expr::ScalarFunction { args, .. } => Ok(args.clone()),
         Expr::ScalarUDF { args, .. } => Ok(args.clone()),
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            let mut expr_list: Vec<Expr> = vec![];
+            expr_list.extend(args.clone());
+            expr_list.push(lit(WINDOW_PARTITION_MARKER));
+            expr_list.extend(partition_by.clone());
+            expr_list.push(lit(WINDOW_SORT_MARKER));
+            expr_list.extend(order_by.clone());
+            Ok(expr_list)
+        }
         Expr::AggregateFunction { args, .. } => Ok(args.clone()),
         Expr::AggregateUDF { args, .. } => Ok(args.clone()),
         Expr::Case {
@@ -319,6 +328,49 @@ pub fn rewrite_expression(expr: &Expr, expressions: &[Expr]) -> Result<Expr> {
             fun: fun.clone(),
             args: expressions.to_vec(),
         }),
+        Expr::WindowFunction {
+            fun, window_frame, ..
+        } => {
+            let partition_index = expressions
+                .iter()
+                .position(|expr| {
+                    matches!(expr, Expr::Literal(ScalarValue::Utf8(Some(str)))
+            if str == WINDOW_PARTITION_MARKER)
+                })
+                .ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "Ill-formed window function expressions: unexpected marker"
+                            .to_owned(),
+                    )
+                })?;
+
+            let sort_index = expressions
+                .iter()
+                .position(|expr| {
+                    matches!(expr, Expr::Literal(ScalarValue::Utf8(Some(str)))
+            if str == WINDOW_SORT_MARKER)
+                })
+                .ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "Ill-formed window function expressions".to_owned(),
+                    )
+                })?;
+
+            if partition_index >= sort_index {
+                Err(DataFusionError::Internal(
+                    "Ill-formed window function expressions: partition index too large"
+                        .to_owned(),
+                ))
+            } else {
+                Ok(Expr::WindowFunction {
+                    fun: fun.clone(),
+                    args: expressions[..partition_index].to_vec(),
+                    partition_by: expressions[partition_index + 1..sort_index].to_vec(),
+                    order_by: expressions[sort_index + 1..].to_vec(),
+                    window_frame: *window_frame,
+                })
+            }
+        }
         Expr::AggregateFunction { fun, distinct, .. } => Ok(Expr::AggregateFunction {
             fun: fun.clone(),
             args: expressions.to_vec(),
@@ -418,21 +470,21 @@ pub fn rewrite_expression(expr: &Expr, expressions: &[Expr]) -> Result<Expr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logical_plan::{col, LogicalPlanBuilder};
+    use crate::logical_plan::col;
     use arrow::datatypes::DataType;
     use std::collections::HashSet;
 
     #[test]
     fn test_collect_expr() -> Result<()> {
-        let mut accum: HashSet<String> = HashSet::new();
-        expr_to_column_names(
+        let mut accum: HashSet<Column> = HashSet::new();
+        expr_to_columns(
             &Expr::Cast {
                 expr: Box::new(col("a")),
                 data_type: DataType::Float64,
             },
             &mut accum,
         )?;
-        expr_to_column_names(
+        expr_to_columns(
             &Expr::Cast {
                 expr: Box::new(col("a")),
                 data_type: DataType::Float64,
@@ -440,64 +492,7 @@ mod tests {
             &mut accum,
         )?;
         assert_eq!(1, accum.len());
-        assert!(accum.contains("a"));
-        Ok(())
-    }
-
-    struct TestOptimizer {}
-
-    impl OptimizerRule for TestOptimizer {
-        fn optimize(
-            &self,
-            plan: &LogicalPlan,
-            _: &ExecutionProps,
-        ) -> Result<LogicalPlan> {
-            Ok(plan.clone())
-        }
-
-        fn name(&self) -> &str {
-            "test_optimizer"
-        }
-    }
-
-    #[test]
-    fn test_optimize_explain() -> Result<()> {
-        let optimizer = TestOptimizer {};
-
-        let empty_plan = LogicalPlanBuilder::empty(false).build()?;
-        let schema = LogicalPlan::explain_schema();
-
-        let optimized_explain = optimize_explain(
-            &optimizer,
-            true,
-            &empty_plan,
-            &[StringifiedPlan::new(PlanType::LogicalPlan, "...")],
-            schema.as_ref(),
-            &ExecutionProps::new(),
-        )?;
-
-        match &optimized_explain {
-            LogicalPlan::Explain {
-                verbose,
-                stringified_plans,
-                ..
-            } => {
-                assert_eq!(*verbose, true);
-
-                let expected_stringified_plans = vec![
-                    StringifiedPlan::new(PlanType::LogicalPlan, "..."),
-                    StringifiedPlan::new(
-                        PlanType::OptimizedLogicalPlan {
-                            optimizer_name: "test_optimizer".into(),
-                        },
-                        "EmptyRelation",
-                    ),
-                ];
-                assert_eq!(*stringified_plans, expected_stringified_plans);
-            }
-            _ => panic!("Expected explain plan but got {:?}", optimized_explain),
-        }
-
+        assert!(accum.contains(&Column::from_name("a")));
         Ok(())
     }
 }

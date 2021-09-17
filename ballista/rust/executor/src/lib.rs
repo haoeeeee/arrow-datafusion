@@ -15,7 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Core executor logic for executing queries and storing results in memory.
+#![doc = include_str!("../README.md")]
 
 pub mod collect;
+pub mod execution_loop;
+pub mod executor;
 pub mod flight_service;
+
+mod standalone;
+pub use standalone::new_standalone_executor;

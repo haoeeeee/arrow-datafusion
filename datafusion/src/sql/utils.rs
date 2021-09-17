@@ -15,24 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::logical_plan::{DFSchema, Expr, LogicalPlan};
+//! SQL Utility Functions
+
+use crate::logical_plan::{Expr, LogicalPlan};
+use crate::scalar::ScalarValue;
 use crate::{
     error::{DataFusionError, Result},
-    logical_plan::{ExpressionVisitor, Recursion},
+    logical_plan::{Column, ExpressionVisitor, Recursion},
 };
 use std::collections::HashMap;
-
-/// Resolves an `Expr::Wildcard` to a collection of `Expr::Column`'s.
-pub(crate) fn expand_wildcard(expr: &Expr, schema: &DFSchema) -> Vec<Expr> {
-    match expr {
-        Expr::Wildcard => schema
-            .fields()
-            .iter()
-            .map(|f| Expr::Column(f.name().to_string()))
-            .collect::<Vec<Expr>>(),
-        _ => vec![expr.clone()],
-    }
-}
 
 /// Collect all deeply nested `Expr::AggregateFunction` and
 /// `Expr::AggregateUDF`. They are returned in order of occurrence (depth
@@ -43,6 +34,22 @@ pub(crate) fn find_aggregate_exprs(exprs: &[Expr]) -> Vec<Expr> {
             nested_expr,
             Expr::AggregateFunction { .. } | Expr::AggregateUDF { .. }
         )
+    })
+}
+
+/// Collect all deeply nested `Expr::Sort`. They are returned in order of occurrence
+/// (depth first), with duplicates omitted.
+pub(crate) fn find_sort_exprs(exprs: &[Expr]) -> Vec<Expr> {
+    find_exprs_in_exprs(exprs, &|nested_expr| {
+        matches!(nested_expr, Expr::Sort { .. })
+    })
+}
+
+/// Collect all deeply nested `Expr::WindowFunction`. They are returned in order of occurrence
+/// (depth first), with duplicates omitted.
+pub(crate) fn find_window_exprs(exprs: &[Expr]) -> Vec<Expr> {
+    find_exprs_in_exprs(exprs, &|nested_expr| {
+        matches!(nested_expr, Expr::WindowFunction { .. })
     })
 }
 
@@ -127,7 +134,7 @@ where
 pub(crate) fn expr_as_column_expr(expr: &Expr, plan: &LogicalPlan) -> Result<Expr> {
     match expr {
         Expr::Column(_) => Ok(expr.clone()),
-        _ => Ok(Expr::Column(expr.name(&plan.schema())?)),
+        _ => Ok(Expr::Column(Column::from_name(expr.name(plan.schema())?))),
     }
 }
 
@@ -216,6 +223,28 @@ where
                     .map(|e| clone_with_replacement(e, replacement_fn))
                     .collect::<Result<Vec<Expr>>>()?,
                 distinct: *distinct,
+            }),
+            Expr::WindowFunction {
+                fun,
+                args,
+                partition_by,
+                order_by,
+                window_frame,
+            } => Ok(Expr::WindowFunction {
+                fun: fun.clone(),
+                args: args
+                    .iter()
+                    .map(|e| clone_with_replacement(e, replacement_fn))
+                    .collect::<Result<Vec<_>>>()?,
+                partition_by: partition_by
+                    .iter()
+                    .map(|e| clone_with_replacement(e, replacement_fn))
+                    .collect::<Result<Vec<_>>>()?,
+                order_by: order_by
+                    .iter()
+                    .map(|e| clone_with_replacement(e, replacement_fn))
+                    .collect::<Result<Vec<_>>>()?,
+                window_frame: *window_frame,
             }),
             Expr::AggregateUDF { fun, args } => Ok(Expr::AggregateUDF {
                 fun: fun.clone(),
@@ -335,7 +364,7 @@ where
                 asc: *asc,
                 nulls_first: *nulls_first,
             }),
-            Expr::Column(_) | Expr::Literal(_) | Expr::ScalarVariable(_) => {
+            Expr::Column { .. } | Expr::Literal(_) | Expr::ScalarVariable(_) => {
                 Ok(expr.clone())
             }
             Expr::Wildcard => Ok(Expr::Wildcard),
@@ -357,6 +386,30 @@ pub(crate) fn extract_aliases(exprs: &[Expr]) -> HashMap<String, Expr> {
         .collect::<HashMap<String, Expr>>()
 }
 
+/// Given an expression that's literal int encoding position, lookup the corresponding expression
+/// in the select_exprs list, if the index is within the bounds and it is indeed a position literal;
+/// Otherwise, return None
+pub(crate) fn resolve_positions_to_exprs(
+    expr: &Expr,
+    select_exprs: &[Expr],
+) -> Option<Expr> {
+    match expr {
+        // sql_expr_to_logical_expr maps number to i64
+        // https://github.com/apache/arrow-datafusion/blob/8d175c759e17190980f270b5894348dc4cff9bbf/datafusion/src/sql/planner.rs#L882-L887
+        Expr::Literal(ScalarValue::Int64(Some(position)))
+            if position > &0_i64 && position <= &(select_exprs.len() as i64) =>
+        {
+            let index = (position - 1) as usize;
+            let select_expr = &select_exprs[index];
+            Some(match select_expr {
+                Expr::Alias(nested_expr, _alias_name) => *nested_expr.clone(),
+                _ => select_expr.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Rebuilds an `Expr` with columns that refer to aliases replaced by the
 /// alias' underlying `Expr`.
 pub(crate) fn resolve_aliases_to_exprs(
@@ -364,8 +417,8 @@ pub(crate) fn resolve_aliases_to_exprs(
     aliases: &HashMap<String, Expr>,
 ) -> Result<Expr> {
     clone_with_replacement(expr, &|nested_expr| match nested_expr {
-        Expr::Column(name) => {
-            if let Some(aliased_expr) = aliases.get(name) {
+        Expr::Column(c) if c.relation.is_none() => {
+            if let Some(aliased_expr) = aliases.get(&c.name) {
                 Ok(Some(aliased_expr.clone()))
             } else {
                 Ok(None)
@@ -373,4 +426,259 @@ pub(crate) fn resolve_aliases_to_exprs(
         }
         _ => Ok(None),
     })
+}
+
+type WindowSortKey = Vec<Expr>;
+
+/// Generate a sort key for a given window expr's partition_by and order_bu expr
+pub(crate) fn generate_sort_key(
+    partition_by: &[Expr],
+    order_by: &[Expr],
+) -> WindowSortKey {
+    let mut sort_key = vec![];
+    partition_by.iter().for_each(|e| {
+        let e = e.clone().sort(true, true);
+        if !sort_key.contains(&e) {
+            sort_key.push(e);
+        }
+    });
+    order_by.iter().for_each(|e| {
+        if !sort_key.contains(e) {
+            sort_key.push(e.clone());
+        }
+    });
+    sort_key
+}
+
+/// given a slice of window expressions sharing the same sort key, find their common partition
+/// keys.
+pub(crate) fn window_expr_common_partition_keys(
+    window_exprs: &[Expr],
+) -> Result<&[Expr]> {
+    let all_partition_keys = window_exprs
+        .iter()
+        .map(|expr| match expr {
+            Expr::WindowFunction { partition_by, .. } => Ok(partition_by),
+            expr => Err(DataFusionError::Execution(format!(
+                "Impossibly got non-window expr {:?}",
+                expr
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let result = all_partition_keys
+        .iter()
+        .min_by_key(|s| s.len())
+        .ok_or_else(|| {
+            DataFusionError::Execution("No window expressions found".to_owned())
+        })?;
+    Ok(result)
+}
+
+/// group a slice of window expression expr by their order by expressions
+pub(crate) fn group_window_expr_by_sort_keys(
+    window_expr: &[Expr],
+) -> Result<Vec<(WindowSortKey, Vec<&Expr>)>> {
+    let mut result = vec![];
+    window_expr.iter().try_for_each(|expr| match expr {
+        Expr::WindowFunction { partition_by, order_by, .. } => {
+            let sort_key = generate_sort_key(partition_by, order_by);
+            if let Some((_, values)) = result.iter_mut().find(
+                |group: &&mut (WindowSortKey, Vec<&Expr>)| matches!(group, (key, _) if *key == sort_key),
+            ) {
+                values.push(expr);
+            } else {
+                result.push((sort_key, vec![expr]))
+            }
+            Ok(())
+        }
+        other => Err(DataFusionError::Internal(format!(
+            "Impossibly got non-window expr {:?}",
+            other,
+        ))),
+    })?;
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logical_plan::col;
+    use crate::physical_plan::aggregates::AggregateFunction;
+    use crate::physical_plan::window_functions::WindowFunction;
+
+    #[test]
+    fn test_group_window_expr_by_sort_keys_empty_case() -> Result<()> {
+        let result = group_window_expr_by_sort_keys(&[])?;
+        let expected: Vec<(WindowSortKey, Vec<&Expr>)> = vec![];
+        assert_eq!(expected, result);
+        Ok(())
+    }
+
+    #[test]
+    fn test_group_window_expr_by_sort_keys_empty_window() -> Result<()> {
+        let max1 = Expr::WindowFunction {
+            fun: WindowFunction::AggregateFunction(AggregateFunction::Max),
+            args: vec![col("name")],
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+        };
+        let max2 = Expr::WindowFunction {
+            fun: WindowFunction::AggregateFunction(AggregateFunction::Max),
+            args: vec![col("name")],
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+        };
+        let min3 = Expr::WindowFunction {
+            fun: WindowFunction::AggregateFunction(AggregateFunction::Min),
+            args: vec![col("name")],
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+        };
+        let sum4 = Expr::WindowFunction {
+            fun: WindowFunction::AggregateFunction(AggregateFunction::Sum),
+            args: vec![col("age")],
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+        };
+        let exprs = &[max1.clone(), max2.clone(), min3.clone(), sum4.clone()];
+        let result = group_window_expr_by_sort_keys(exprs)?;
+        let key = vec![];
+        let expected: Vec<(WindowSortKey, Vec<&Expr>)> =
+            vec![(key, vec![&max1, &max2, &min3, &sum4])];
+        assert_eq!(expected, result);
+        Ok(())
+    }
+
+    #[test]
+    fn test_group_window_expr_by_sort_keys() -> Result<()> {
+        let age_asc = Expr::Sort {
+            expr: Box::new(col("age")),
+            asc: true,
+            nulls_first: true,
+        };
+        let name_desc = Expr::Sort {
+            expr: Box::new(col("name")),
+            asc: false,
+            nulls_first: true,
+        };
+        let created_at_desc = Expr::Sort {
+            expr: Box::new(col("created_at")),
+            asc: false,
+            nulls_first: true,
+        };
+        let max1 = Expr::WindowFunction {
+            fun: WindowFunction::AggregateFunction(AggregateFunction::Max),
+            args: vec![col("name")],
+            partition_by: vec![],
+            order_by: vec![age_asc.clone(), name_desc.clone()],
+            window_frame: None,
+        };
+        let max2 = Expr::WindowFunction {
+            fun: WindowFunction::AggregateFunction(AggregateFunction::Max),
+            args: vec![col("name")],
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+        };
+        let min3 = Expr::WindowFunction {
+            fun: WindowFunction::AggregateFunction(AggregateFunction::Min),
+            args: vec![col("name")],
+            partition_by: vec![],
+            order_by: vec![age_asc.clone(), name_desc.clone()],
+            window_frame: None,
+        };
+        let sum4 = Expr::WindowFunction {
+            fun: WindowFunction::AggregateFunction(AggregateFunction::Sum),
+            args: vec![col("age")],
+            partition_by: vec![],
+            order_by: vec![name_desc.clone(), age_asc.clone(), created_at_desc.clone()],
+            window_frame: None,
+        };
+        // FIXME use as_ref
+        let exprs = &[max1.clone(), max2.clone(), min3.clone(), sum4.clone()];
+        let result = group_window_expr_by_sort_keys(exprs)?;
+
+        let key1 = vec![age_asc.clone(), name_desc.clone()];
+        let key2 = vec![];
+        let key3 = vec![name_desc, age_asc, created_at_desc];
+
+        let expected: Vec<(WindowSortKey, Vec<&Expr>)> = vec![
+            (key1, vec![&max1, &min3]),
+            (key2, vec![&max2]),
+            (key3, vec![&sum4]),
+        ];
+        assert_eq!(expected, result);
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_sort_exprs() -> Result<()> {
+        let exprs = &[
+            Expr::WindowFunction {
+                fun: WindowFunction::AggregateFunction(AggregateFunction::Max),
+                args: vec![col("name")],
+                partition_by: vec![],
+                order_by: vec![
+                    Expr::Sort {
+                        expr: Box::new(col("age")),
+                        asc: true,
+                        nulls_first: true,
+                    },
+                    Expr::Sort {
+                        expr: Box::new(col("name")),
+                        asc: false,
+                        nulls_first: true,
+                    },
+                ],
+                window_frame: None,
+            },
+            Expr::WindowFunction {
+                fun: WindowFunction::AggregateFunction(AggregateFunction::Sum),
+                args: vec![col("age")],
+                partition_by: vec![],
+                order_by: vec![
+                    Expr::Sort {
+                        expr: Box::new(col("name")),
+                        asc: false,
+                        nulls_first: true,
+                    },
+                    Expr::Sort {
+                        expr: Box::new(col("age")),
+                        asc: true,
+                        nulls_first: true,
+                    },
+                    Expr::Sort {
+                        expr: Box::new(col("created_at")),
+                        asc: false,
+                        nulls_first: true,
+                    },
+                ],
+                window_frame: None,
+            },
+        ];
+        let expected = vec![
+            Expr::Sort {
+                expr: Box::new(col("age")),
+                asc: true,
+                nulls_first: true,
+            },
+            Expr::Sort {
+                expr: Box::new(col("name")),
+                asc: false,
+                nulls_first: true,
+            },
+            Expr::Sort {
+                expr: Box::new(col("created_at")),
+                asc: false,
+                nulls_first: true,
+            },
+        ];
+        let result = find_sort_exprs(exprs);
+        assert_eq!(expected, result);
+        Ok(())
+    }
 }

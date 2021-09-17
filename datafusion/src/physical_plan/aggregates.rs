@@ -37,7 +37,6 @@ use crate::physical_plan::expressions;
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use expressions::{avg_return_type, sum_return_type};
 use std::{fmt, str::FromStr, sync::Arc};
-
 /// the implementation of an aggregate function
 pub type AccumulatorFunctionImplementation =
     Arc<dyn Fn() -> Result<Box<dyn Accumulator>> + Send + Sync>;
@@ -111,17 +110,24 @@ pub fn create_aggregate_expr(
     distinct: bool,
     args: &[Arc<dyn PhysicalExpr>],
     input_schema: &Schema,
-    name: String,
+    name: impl Into<String>,
 ) -> Result<Arc<dyn AggregateExpr>> {
-    // coerce
-    let arg = coerce(args, input_schema, &signature(fun))?[0].clone();
+    let name = name.into();
+    let arg = coerce(args, input_schema, &signature(fun))?;
+    if arg.is_empty() {
+        return Err(DataFusionError::Plan(format!(
+            "Invalid or wrong number of arguments passed to aggregate: '{}'",
+            name,
+        )));
+    }
+    let arg = arg[0].clone();
 
     let arg_types = args
         .iter()
         .map(|e| e.data_type(input_schema))
         .collect::<Result<Vec<_>>>()?;
 
-    let return_type = return_type(&fun, &arg_types)?;
+    let return_type = return_type(fun, &arg_types)?;
 
     Ok(match (fun, distinct) {
         (AggregateFunction::Count, false) => {
@@ -182,8 +188,10 @@ static TIMESTAMPS: &[DataType] = &[
     DataType::Timestamp(TimeUnit::Nanosecond, None),
 ];
 
+static DATES: &[DataType] = &[DataType::Date32, DataType::Date64];
+
 /// the signatures supported by the function `fun`.
-fn signature(fun: &AggregateFunction) -> Signature {
+pub fn signature(fun: &AggregateFunction) -> Signature {
     // note: the physical expression must accept the type returned by this function or the execution panics.
     match fun {
         AggregateFunction::Count => Signature::Any(1),
@@ -192,6 +200,7 @@ fn signature(fun: &AggregateFunction) -> Signature {
                 .iter()
                 .chain(NUMERICS.iter())
                 .chain(TIMESTAMPS.iter())
+                .chain(DATES.iter())
                 .cloned()
                 .collect::<Vec<_>>();
             Signature::Uniform(1, valid)

@@ -19,19 +19,20 @@ pub mod from_proto;
 pub mod to_proto;
 
 #[cfg(test)]
-
 mod roundtrip_tests {
 
     use super::super::{super::error::Result, protobuf};
     use crate::error::BallistaError;
-    use arrow::datatypes::{DataType, Field, Schema};
     use core::panic;
-    use datafusion::physical_plan::functions::BuiltinScalarFunction::Sqrt;
     use datafusion::{
-        logical_plan::{Expr, LogicalPlan, LogicalPlanBuilder},
-        physical_plan::csv::CsvReadOptions,
+        arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit},
+        logical_plan::{
+            col, Expr, LogicalPlan, LogicalPlanBuilder, Partitioning, ToDFSchema,
+        },
+        physical_plan::{csv::CsvReadOptions, functions::BuiltinScalarFunction::Sqrt},
         prelude::*,
         scalar::ScalarValue,
+        sql::parser::FileType,
     };
     use protobuf::arrow_type;
     use std::convert::TryInto;
@@ -57,16 +58,13 @@ mod roundtrip_tests {
     }
 
     #[test]
-
     fn roundtrip_repartition() -> Result<()> {
         use datafusion::logical_plan::Partitioning;
 
         let test_batch_sizes = [usize::MIN, usize::MAX, 43256];
 
-        let test_expr: Vec<Expr> = vec![
-            Expr::Column("c1".to_string()) + Expr::Column("c2".to_string()),
-            Expr::Literal((4.0).into()),
-        ];
+        let test_expr: Vec<Expr> =
+            vec![col("c1") + col("c2"), Expr::Literal((4.0).into())];
 
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -119,64 +117,66 @@ mod roundtrip_tests {
         Ok(())
     }
 
-    fn new_box_field(
-        name: &str,
-        dt: DataType,
-        nullable: bool,
-    ) -> Box<arrow::datatypes::Field> {
-        Box::new(arrow::datatypes::Field::new(name, dt, nullable))
+    fn new_box_field(name: &str, dt: DataType, nullable: bool) -> Box<Field> {
+        Box::new(Field::new(name, dt, nullable))
     }
 
     #[test]
     fn scalar_values_error_serialization() -> Result<()> {
-        use arrow::datatypes::DataType;
-        use datafusion::scalar::ScalarValue;
         let should_fail_on_seralize: Vec<ScalarValue> = vec![
             //Should fail due to inconsistent types
             ScalarValue::List(
-                Some(vec![
+                Some(Box::new(vec![
                     ScalarValue::Int16(None),
                     ScalarValue::Float32(Some(32.0)),
-                ]),
-                DataType::List(new_box_field("item", DataType::Int16, true)),
+                ])),
+                Box::new(DataType::List(new_box_field("item", DataType::Int16, true))),
             ),
             ScalarValue::List(
-                Some(vec![
+                Some(Box::new(vec![
                     ScalarValue::Float32(None),
                     ScalarValue::Float32(Some(32.0)),
-                ]),
-                DataType::List(new_box_field("item", DataType::Int16, true)),
+                ])),
+                Box::new(DataType::List(new_box_field("item", DataType::Int16, true))),
             ),
             ScalarValue::List(
-                Some(vec![
+                Some(Box::new(vec![
                     ScalarValue::List(
                         None,
-                        DataType::List(new_box_field("level2", DataType::Float32, true)),
+                        Box::new(DataType::List(new_box_field(
+                            "level2",
+                            DataType::Float32,
+                            true,
+                        ))),
                     ),
                     ScalarValue::List(
-                        Some(vec![
+                        Some(Box::new(vec![
                             ScalarValue::Float32(Some(-213.1)),
                             ScalarValue::Float32(None),
                             ScalarValue::Float32(Some(5.5)),
                             ScalarValue::Float32(Some(2.0)),
                             ScalarValue::Float32(Some(1.0)),
-                        ]),
-                        DataType::List(new_box_field("level2", DataType::Float32, true)),
+                        ])),
+                        Box::new(DataType::List(new_box_field(
+                            "level2",
+                            DataType::Float32,
+                            true,
+                        ))),
                     ),
                     ScalarValue::List(
                         None,
-                        DataType::List(new_box_field(
+                        Box::new(DataType::List(new_box_field(
                             "lists are typed inconsistently",
                             DataType::Int16,
                             true,
-                        )),
+                        ))),
                     ),
-                ]),
-                DataType::List(new_box_field(
+                ])),
+                Box::new(DataType::List(new_box_field(
                     "level1",
                     DataType::List(new_box_field("level2", DataType::Float32, true)),
                     true,
-                )),
+                ))),
             ),
         ];
 
@@ -194,8 +194,6 @@ mod roundtrip_tests {
 
     #[test]
     fn round_trip_scalar_values() -> Result<()> {
-        use arrow::datatypes::DataType;
-        use datafusion::scalar::ScalarValue;
         let should_pass: Vec<ScalarValue> = vec![
             ScalarValue::Boolean(None),
             ScalarValue::Float32(None),
@@ -210,7 +208,7 @@ mod roundtrip_tests {
             ScalarValue::UInt64(None),
             ScalarValue::Utf8(None),
             ScalarValue::LargeUtf8(None),
-            ScalarValue::List(None, DataType::Boolean),
+            ScalarValue::List(None, Box::new(DataType::Boolean)),
             ScalarValue::Date32(None),
             ScalarValue::TimestampMicrosecond(None),
             ScalarValue::TimestampNanosecond(None),
@@ -258,37 +256,49 @@ mod roundtrip_tests {
             ScalarValue::TimestampMicrosecond(Some(i64::MAX)),
             ScalarValue::TimestampMicrosecond(None),
             ScalarValue::List(
-                Some(vec![
+                Some(Box::new(vec![
                     ScalarValue::Float32(Some(-213.1)),
                     ScalarValue::Float32(None),
                     ScalarValue::Float32(Some(5.5)),
                     ScalarValue::Float32(Some(2.0)),
                     ScalarValue::Float32(Some(1.0)),
-                ]),
-                DataType::List(new_box_field("level1", DataType::Float32, true)),
+                ])),
+                Box::new(DataType::List(new_box_field(
+                    "level1",
+                    DataType::Float32,
+                    true,
+                ))),
             ),
             ScalarValue::List(
-                Some(vec![
+                Some(Box::new(vec![
                     ScalarValue::List(
                         None,
-                        DataType::List(new_box_field("level2", DataType::Float32, true)),
+                        Box::new(DataType::List(new_box_field(
+                            "level2",
+                            DataType::Float32,
+                            true,
+                        ))),
                     ),
                     ScalarValue::List(
-                        Some(vec![
+                        Some(Box::new(vec![
                             ScalarValue::Float32(Some(-213.1)),
                             ScalarValue::Float32(None),
                             ScalarValue::Float32(Some(5.5)),
                             ScalarValue::Float32(Some(2.0)),
                             ScalarValue::Float32(Some(1.0)),
-                        ]),
-                        DataType::List(new_box_field("level2", DataType::Float32, true)),
+                        ])),
+                        Box::new(DataType::List(new_box_field(
+                            "level2",
+                            DataType::Float32,
+                            true,
+                        ))),
                     ),
-                ]),
-                DataType::List(new_box_field(
+                ])),
+                Box::new(DataType::List(new_box_field(
                     "level1",
                     DataType::List(new_box_field("level2", DataType::Float32, true)),
                     true,
-                )),
+                ))),
             ),
         ];
 
@@ -302,8 +312,6 @@ mod roundtrip_tests {
 
     #[test]
     fn round_trip_scalar_types() -> Result<()> {
-        use arrow::datatypes::DataType;
-        use arrow::datatypes::{IntervalUnit, TimeUnit};
         let should_pass: Vec<DataType> = vec![
             DataType::Boolean,
             DataType::Int8,
@@ -459,8 +467,6 @@ mod roundtrip_tests {
 
     #[test]
     fn round_trip_datatype() -> Result<()> {
-        use arrow::datatypes::DataType;
-        use arrow::datatypes::{IntervalUnit, TimeUnit};
         let test_cases: Vec<DataType> = vec![
             DataType::Null,
             DataType::Boolean,
@@ -592,9 +598,6 @@ mod roundtrip_tests {
 
     #[test]
     fn roundtrip_null_scalar_values() -> Result<()> {
-        use arrow::datatypes::DataType;
-        use arrow::datatypes::Field;
-        use datafusion::scalar::ScalarValue;
         let test_types = vec![
             ScalarValue::Boolean(None),
             ScalarValue::Float32(None),
@@ -629,7 +632,6 @@ mod roundtrip_tests {
     }
 
     #[test]
-
     fn roundtrip_create_external_table() -> Result<()> {
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -639,14 +641,14 @@ mod roundtrip_tests {
             Field::new("salary", DataType::Int32, false),
         ]);
 
-        use datafusion::logical_plan::ToDFSchema;
-
         let df_schema_ref = schema.to_dfschema_ref()?;
 
-        use datafusion::sql::parser::FileType;
-
-        let filetypes: [FileType; 3] =
-            [FileType::NdJson, FileType::Parquet, FileType::CSV];
+        let filetypes: [FileType; 4] = [
+            FileType::NdJson,
+            FileType::Parquet,
+            FileType::CSV,
+            FileType::Avro,
+        ];
 
         for file in filetypes.iter() {
             let create_table_node = LogicalPlan::CreateExternalTable {
@@ -664,7 +666,43 @@ mod roundtrip_tests {
     }
 
     #[test]
+    fn roundtrip_analyze() -> Result<()> {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("first_name", DataType::Utf8, false),
+            Field::new("last_name", DataType::Utf8, false),
+            Field::new("state", DataType::Utf8, false),
+            Field::new("salary", DataType::Int32, false),
+        ]);
 
+        let verbose_plan = LogicalPlanBuilder::scan_csv(
+            "employee.csv",
+            CsvReadOptions::new().schema(&schema).has_header(true),
+            Some(vec![3, 4]),
+        )
+        .and_then(|plan| plan.sort(vec![col("salary")]))
+        .and_then(|plan| plan.explain(true, true))
+        .and_then(|plan| plan.build())
+        .map_err(BallistaError::DataFusionError)?;
+
+        let plan = LogicalPlanBuilder::scan_csv(
+            "employee.csv",
+            CsvReadOptions::new().schema(&schema).has_header(true),
+            Some(vec![3, 4]),
+        )
+        .and_then(|plan| plan.sort(vec![col("salary")]))
+        .and_then(|plan| plan.explain(false, true))
+        .and_then(|plan| plan.build())
+        .map_err(BallistaError::DataFusionError)?;
+
+        roundtrip_test!(plan);
+
+        roundtrip_test!(verbose_plan);
+
+        Ok(())
+    }
+
+    #[test]
     fn roundtrip_explain() -> Result<()> {
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -680,7 +718,7 @@ mod roundtrip_tests {
             Some(vec![3, 4]),
         )
         .and_then(|plan| plan.sort(vec![col("salary")]))
-        .and_then(|plan| plan.explain(true))
+        .and_then(|plan| plan.explain(true, false))
         .and_then(|plan| plan.build())
         .map_err(BallistaError::DataFusionError)?;
 
@@ -690,7 +728,7 @@ mod roundtrip_tests {
             Some(vec![3, 4]),
         )
         .and_then(|plan| plan.sort(vec![col("salary")]))
-        .and_then(|plan| plan.explain(false))
+        .and_then(|plan| plan.explain(false, false))
         .and_then(|plan| plan.build())
         .map_err(BallistaError::DataFusionError)?;
 
@@ -711,15 +749,20 @@ mod roundtrip_tests {
             Field::new("salary", DataType::Int32, false),
         ]);
 
-        let scan_plan = LogicalPlanBuilder::empty(false)
-            .build()
-            .map_err(BallistaError::DataFusionError)?;
-        let plan = LogicalPlanBuilder::scan_csv(
-            "employee.csv",
+        let scan_plan = LogicalPlanBuilder::scan_csv(
+            "employee1",
             CsvReadOptions::new().schema(&schema).has_header(true),
-            Some(vec![3, 4]),
+            Some(vec![0, 3, 4]),
+        )?
+        .build()
+        .map_err(BallistaError::DataFusionError)?;
+
+        let plan = LogicalPlanBuilder::scan_csv(
+            "employee2",
+            CsvReadOptions::new().schema(&schema).has_header(true),
+            Some(vec![0, 3, 4]),
         )
-        .and_then(|plan| plan.join(&scan_plan, JoinType::Inner, &["id"], &["id"]))
+        .and_then(|plan| plan.join(&scan_plan, JoinType::Inner, (vec!["id"], vec!["id"])))
         .and_then(|plan| plan.build())
         .map_err(BallistaError::DataFusionError)?;
 
@@ -751,7 +794,6 @@ mod roundtrip_tests {
     }
 
     #[test]
-
     fn roundtrip_empty_relation() -> Result<()> {
         let plan_false = LogicalPlanBuilder::empty(false)
             .build()
@@ -769,7 +811,6 @@ mod roundtrip_tests {
     }
 
     #[test]
-
     fn roundtrip_logical_plan() -> Result<()> {
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -794,7 +835,6 @@ mod roundtrip_tests {
     }
 
     #[test]
-
     fn roundtrip_not() -> Result<()> {
         let test_expr = Expr::Not(Box::new(Expr::Literal((1.0).into())));
 
@@ -804,9 +844,8 @@ mod roundtrip_tests {
     }
 
     #[test]
-
     fn roundtrip_is_null() -> Result<()> {
-        let test_expr = Expr::IsNull(Box::new(Expr::Column("id".into())));
+        let test_expr = Expr::IsNull(Box::new(col("id")));
 
         roundtrip_test!(test_expr, protobuf::LogicalExprNode, Expr);
 
@@ -814,9 +853,8 @@ mod roundtrip_tests {
     }
 
     #[test]
-
     fn roundtrip_is_not_null() -> Result<()> {
-        let test_expr = Expr::IsNotNull(Box::new(Expr::Column("id".into())));
+        let test_expr = Expr::IsNotNull(Box::new(col("id")));
 
         roundtrip_test!(test_expr, protobuf::LogicalExprNode, Expr);
 
@@ -824,7 +862,6 @@ mod roundtrip_tests {
     }
 
     #[test]
-
     fn roundtrip_between() -> Result<()> {
         let test_expr = Expr::Between {
             expr: Box::new(Expr::Literal((1.0).into())),
@@ -839,7 +876,6 @@ mod roundtrip_tests {
     }
 
     #[test]
-
     fn roundtrip_case() -> Result<()> {
         let test_expr = Expr::Case {
             expr: Some(Box::new(Expr::Literal((1.0).into()))),
@@ -856,7 +892,6 @@ mod roundtrip_tests {
     }
 
     #[test]
-
     fn roundtrip_cast() -> Result<()> {
         let test_expr = Expr::Cast {
             expr: Box::new(Expr::Literal((1.0).into())),
@@ -869,7 +904,6 @@ mod roundtrip_tests {
     }
 
     #[test]
-
     fn roundtrip_sort_expr() -> Result<()> {
         let test_expr = Expr::Sort {
             expr: Box::new(Expr::Literal((1.0).into())),
@@ -883,7 +917,6 @@ mod roundtrip_tests {
     }
 
     #[test]
-
     fn roundtrip_negative() -> Result<()> {
         let test_expr = Expr::Negative(Box::new(Expr::Literal((1.0).into())));
 
@@ -893,7 +926,6 @@ mod roundtrip_tests {
     }
 
     #[test]
-
     fn roundtrip_inlist() -> Result<()> {
         let test_expr = Expr::InList {
             expr: Box::new(Expr::Literal((1.0).into())),
@@ -907,7 +939,6 @@ mod roundtrip_tests {
     }
 
     #[test]
-
     fn roundtrip_wildcard() -> Result<()> {
         let test_expr = Expr::Wildcard;
 

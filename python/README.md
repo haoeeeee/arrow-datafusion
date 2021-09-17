@@ -19,7 +19,7 @@
 
 ## DataFusion in Python
 
-This is a Python library that binds to [Apache Arrow](https://arrow.apache.org/) in-memory query engine [DataFusion](https://github.com/apache/arrow/tree/master/rust/datafusion).
+This is a Python library that binds to [Apache Arrow](https://arrow.apache.org/) in-memory query engine [DataFusion](https://github.com/apache/arrow-datafusion).
 
 Like pyspark, it allows you to build a plan through SQL or a DataFrame API against in-memory data, parquet or CSV files, run it in a multi-threaded environment, and obtain the result back in Python.
 
@@ -115,10 +115,12 @@ df = df.aggregate(
 )
 ```
 
-## How to install
+## How to install (from pip)
 
 ```bash
 pip install datafusion
+# or
+python -m pip install datafusion
 ```
 
 ## How to develop
@@ -130,17 +132,50 @@ Bootstrap:
 ```bash
 # fetch this repo
 git clone git@github.com:apache/arrow-datafusion.git
-
+# change to python directory
 cd arrow-datafusion/python
-
 # prepare development environment (used to build wheel / install in development)
 python3 -m venv venv
-pip install maturin==0.10.4 toml==0.10.1 pyarrow==1.0.0
+# activate the venv
+source venv/bin/activate
+# update pip itself if necessary
+python -m pip install -U pip
+# if python -V gives python 3.7
+python -m pip install -r requirements-37.txt
+# if python -V gives python 3.8
+python -m pip install -r requirements-38.txt
+# if python -V gives python 3.9
+python -m pip install -r requirements-39.txt
 ```
 
-Whenever rust code changes (your changes or via git pull):
+Whenever rust code changes (your changes or via `git pull`):
 
 ```bash
-venv/bin/maturin develop
-venv/bin/python -m unittest discover tests
+# make sure you activate the venv using "source venv/bin/activate" first
+maturin develop
+python -m pytest
 ```
+
+## How to update dependencies
+
+To change test dependencies, change the `requirements.in` and run
+
+```bash
+# install pip-tools (this can be done only once), also consider running in venv
+python -m pip install pip-tools
+
+# change requirements.in and then run
+python -m piptools compile --generate-hashes -o requirements-37.txt
+# or run this is you are on python 3.8
+python -m piptools compile --generate-hashes -o requirements-38.txt
+# or run this is you are on python 3.9
+python -m piptools compile --generate-hashes -o requirements-39.txt
+```
+
+To update dependencies, run with `-U`
+
+```bash
+python -m piptools compile -U --generate-hashes -o requirements-39.txt
+```
+
+More details [here](https://github.com/jazzband/pip-tools)

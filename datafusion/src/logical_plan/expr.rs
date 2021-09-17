@@ -19,21 +19,160 @@
 //! such as `col = 5` or `SUM(col)`. See examples on the [`Expr`] struct.
 
 pub use super::Operator;
-
-use std::fmt;
-use std::sync::Arc;
-
-use aggregates::{AccumulatorFunctionImplementation, StateTypeFunction};
-use arrow::{compute::can_cast_types, datatypes::DataType};
-
 use crate::error::{DataFusionError, Result};
-use crate::logical_plan::{DFField, DFSchema};
+use crate::logical_plan::{window_frames, DFField, DFSchema, LogicalPlan};
 use crate::physical_plan::{
     aggregates, expressions::binary_operator_data_type, functions, udf::ScalarUDF,
+    window_functions,
 };
 use crate::{physical_plan::udaf::AggregateUDF, scalar::ScalarValue};
+use aggregates::{AccumulatorFunctionImplementation, StateTypeFunction};
+use arrow::{compute::can_cast_types, datatypes::DataType};
 use functions::{ReturnTypeFunction, ScalarFunctionImplementation, Signature};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
+use std::fmt;
+use std::ops::Not;
+use std::str::FromStr;
+use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+
+/// A named reference to a qualified field in a schema.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
+pub struct Column {
+    /// relation/table name.
+    pub relation: Option<String>,
+    /// field/column name.
+    pub name: String,
+}
+
+impl Column {
+    /// Create Column from unqualified name.
+    pub fn from_name(name: impl Into<String>) -> Self {
+        Self {
+            relation: None,
+            name: name.into(),
+        }
+    }
+
+    /// Deserialize a fully qualified name string into a column
+    pub fn from_qualified_name(flat_name: &str) -> Self {
+        use sqlparser::tokenizer::Token;
+
+        let dialect = sqlparser::dialect::GenericDialect {};
+        let mut tokenizer = sqlparser::tokenizer::Tokenizer::new(&dialect, flat_name);
+        if let Ok(tokens) = tokenizer.tokenize() {
+            if let [Token::Word(relation), Token::Period, Token::Word(name)] =
+                tokens.as_slice()
+            {
+                return Column {
+                    relation: Some(relation.value.clone()),
+                    name: name.value.clone(),
+                };
+            }
+        }
+        // any expression that's not in the form of `foo.bar` will be treated as unqualified column
+        // name
+        Column {
+            relation: None,
+            name: String::from(flat_name),
+        }
+    }
+
+    /// Serialize column into a flat name string
+    pub fn flat_name(&self) -> String {
+        match &self.relation {
+            Some(r) => format!("{}.{}", r, self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    /// Normalizes `self` if is unqualified (has no relation name)
+    /// with an explicit qualifier from the first matching input
+    /// schemas.
+    ///
+    /// For example, `foo` will be normalized to `t.foo` if there is a
+    /// column named `foo` in a relation named `t` found in `schemas`
+    pub fn normalize(self, plan: &LogicalPlan) -> Result<Self> {
+        let schemas = plan.all_schemas();
+        let using_columns = plan.using_columns()?;
+        self.normalize_with_schemas(&schemas, &using_columns)
+    }
+
+    // Internal implementation of normalize
+    fn normalize_with_schemas(
+        self,
+        schemas: &[&Arc<DFSchema>],
+        using_columns: &[HashSet<Column>],
+    ) -> Result<Self> {
+        if self.relation.is_some() {
+            return Ok(self);
+        }
+
+        for schema in schemas {
+            let fields = schema.fields_with_unqualified_name(&self.name);
+            match fields.len() {
+                0 => continue,
+                1 => {
+                    return Ok(fields[0].qualified_column());
+                }
+                _ => {
+                    // More than 1 fields in this schema have their names set to self.name.
+                    //
+                    // This should only happen when a JOIN query with USING constraint references
+                    // join columns using unqualified column name. For example:
+                    //
+                    // ```sql
+                    // SELECT id FROM t1 JOIN t2 USING(id)
+                    // ```
+                    //
+                    // In this case, both `t1.id` and `t2.id` will match unqualified column `id`.
+                    // We will use the relation from the first matched field to normalize self.
+
+                    // Compare matched fields with one USING JOIN clause at a time
+                    for using_col in using_columns {
+                        let all_matched = fields
+                            .iter()
+                            .all(|f| using_col.contains(&f.qualified_column()));
+                        // All matched fields belong to the same using column set, in orther words
+                        // the same join clause. We simply pick the qualifer from the first match.
+                        if all_matched {
+                            return Ok(fields[0].qualified_column());
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(DataFusionError::Plan(format!(
+            "Column {} not found in provided schemas",
+            self
+        )))
+    }
+}
+
+impl From<&str> for Column {
+    fn from(c: &str) -> Self {
+        Self::from_qualified_name(c)
+    }
+}
+
+impl FromStr for Column {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(s.into())
+    }
+}
+
+impl fmt::Display for Column {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.relation {
+            Some(r) => write!(f, "#{}.{}", r, self.name),
+            None => write!(f, "#{}", self.name),
+        }
+    }
+}
 
 /// `Expr` is a central struct of DataFusion's query API, and
 /// represent logical expressions such as `A + 1`, or `CAST(c1 AS
@@ -49,7 +188,7 @@ use std::collections::HashSet;
 /// ```
 /// # use datafusion::logical_plan::*;
 /// let expr = col("c1");
-/// assert_eq!(expr, Expr::Column("c1".to_string()));
+/// assert_eq!(expr, Expr::Column(Column::from_name("c1")));
 /// ```
 ///
 /// ## Create the expression `c1 + c2` to add columns "c1" and "c2" together
@@ -83,8 +222,8 @@ use std::collections::HashSet;
 pub enum Expr {
     /// An expression with a specific name.
     Alias(Box<Expr>, String),
-    /// A named reference to a field in a schema.
-    Column(String),
+    /// A named reference to a qualified filed in a schema.
+    Column(Column),
     /// A named reference to a variable in a registry.
     ScalarVariable(Vec<String>),
     /// A constant value.
@@ -190,6 +329,19 @@ pub enum Expr {
         /// Whether this is a DISTINCT aggregation or not
         distinct: bool,
     },
+    /// Represents the call of a window function with arguments.
+    WindowFunction {
+        /// Name of the function
+        fun: window_functions::WindowFunction,
+        /// List of expressions to feed to the functions as arguments
+        args: Vec<Expr>,
+        /// List of partition by expressions
+        partition_by: Vec<Expr>,
+        /// List of order by expressions
+        order_by: Vec<Expr>,
+        /// Window frame
+        window_frame: Option<window_frames::WindowFrame>,
+    },
     /// aggregate function
     AggregateUDF {
         /// The function
@@ -221,10 +373,7 @@ impl Expr {
     pub fn get_type(&self, schema: &DFSchema) -> Result<DataType> {
         match self {
             Expr::Alias(expr, _) => expr.get_type(schema),
-            Expr::Column(name) => Ok(schema
-                .field_with_unqualified_name(name)?
-                .data_type()
-                .clone()),
+            Expr::Column(c) => Ok(schema.field_from_column(c)?.data_type().clone()),
             Expr::ScalarVariable(_) => Ok(DataType::Utf8),
             Expr::Literal(l) => Ok(l.get_datatype()),
             Expr::Case { when_then_expr, .. } => when_then_expr[0].1.get_type(schema),
@@ -243,6 +392,13 @@ impl Expr {
                     .map(|e| e.get_type(schema))
                     .collect::<Result<Vec<_>>>()?;
                 functions::return_type(fun, &data_types)
+            }
+            Expr::WindowFunction { fun, args, .. } => {
+                let data_types = args
+                    .iter()
+                    .map(|e| e.get_type(schema))
+                    .collect::<Result<Vec<_>>>()?;
+                window_functions::return_type(fun, &data_types)
             }
             Expr::AggregateFunction { fun, args, .. } => {
                 let data_types = args
@@ -289,9 +445,7 @@ impl Expr {
     pub fn nullable(&self, input_schema: &DFSchema) -> Result<bool> {
         match self {
             Expr::Alias(expr, _) => expr.nullable(input_schema),
-            Expr::Column(name) => Ok(input_schema
-                .field_with_unqualified_name(name)?
-                .is_nullable()),
+            Expr::Column(c) => Ok(input_schema.field_from_column(c)?.is_nullable()),
             Expr::Literal(value) => Ok(value.is_null()),
             Expr::ScalarVariable(_) => Ok(true),
             Expr::Case {
@@ -316,6 +470,7 @@ impl Expr {
             Expr::TryCast { .. } => Ok(true),
             Expr::ScalarFunction { .. } => Ok(true),
             Expr::ScalarUDF { .. } => Ok(true),
+            Expr::WindowFunction { .. } => Ok(true),
             Expr::AggregateFunction { .. } => Ok(true),
             Expr::AggregateUDF { .. } => Ok(true),
             Expr::Not(expr) => expr.nullable(input_schema),
@@ -336,7 +491,7 @@ impl Expr {
         }
     }
 
-    /// Returns the name of this expression based on [arrow::datatypes::Schema].
+    /// Returns the name of this expression based on [crate::logical_plan::DFSchema].
     ///
     /// This represents how a column with this expression is named when no alias is chosen
     pub fn name(&self, input_schema: &DFSchema) -> Result<String> {
@@ -345,12 +500,20 @@ impl Expr {
 
     /// Returns a [arrow::datatypes::Field] compatible with this expression.
     pub fn to_field(&self, input_schema: &DFSchema) -> Result<DFField> {
-        Ok(DFField::new(
-            None, //TODO  qualifier
-            &self.name(input_schema)?,
-            self.get_type(input_schema)?,
-            self.nullable(input_schema)?,
-        ))
+        match self {
+            Expr::Column(c) => Ok(DFField::new(
+                c.relation.as_deref(),
+                &c.name,
+                self.get_type(input_schema)?,
+                self.nullable(input_schema)?,
+            )),
+            _ => Ok(DFField::new(
+                None,
+                &self.name(input_schema)?,
+                self.get_type(input_schema)?,
+                self.nullable(input_schema)?,
+            )),
+        }
     }
 
     /// Wraps this expression in a cast to a target [arrow::datatypes::DataType].
@@ -419,13 +582,13 @@ impl Expr {
     /// Return `!self`
     #[allow(clippy::should_implement_trait)]
     pub fn not(self) -> Expr {
-        Expr::Not(Box::new(self))
+        !self
     }
 
     /// Calculate the modulus of two expressions.
     /// Return `self % other`
     pub fn modulus(self, other: Expr) -> Expr {
-        binary_expr(self, Operator::Modulus, other)
+        binary_expr(self, Operator::Modulo, other)
     }
 
     /// Return `self LIKE other`
@@ -521,7 +684,7 @@ impl Expr {
         // recurse (and cover all expression types)
         let visitor = match self {
             Expr::Alias(expr, _) => expr.accept(visitor),
-            Expr::Column(..) => Ok(visitor),
+            Expr::Column(_) => Ok(visitor),
             Expr::ScalarVariable(..) => Ok(visitor),
             Expr::Literal(..) => Ok(visitor),
             Expr::BinaryExpr { left, right, .. } => {
@@ -571,6 +734,23 @@ impl Expr {
             Expr::ScalarUDF { args, .. } => args
                 .iter()
                 .try_fold(visitor, |visitor, arg| arg.accept(visitor)),
+            Expr::WindowFunction {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                let visitor = args
+                    .iter()
+                    .try_fold(visitor, |visitor, arg| arg.accept(visitor))?;
+                let visitor = partition_by
+                    .iter()
+                    .try_fold(visitor, |visitor, arg| arg.accept(visitor))?;
+                let visitor = order_by
+                    .iter()
+                    .try_fold(visitor, |visitor, arg| arg.accept(visitor))?;
+                Ok(visitor)
+            }
             Expr::AggregateFunction { args, .. } => args
                 .iter()
                 .try_fold(visitor, |visitor, arg| arg.accept(visitor)),
@@ -632,7 +812,7 @@ impl Expr {
         // recurse into all sub expressions(and cover all expression types)
         let expr = match self {
             Expr::Alias(expr, name) => Expr::Alias(rewrite_boxed(expr, rewriter)?, name),
-            Expr::Column(name) => Expr::Column(name),
+            Expr::Column(_) => self.clone(),
             Expr::ScalarVariable(names) => Expr::ScalarVariable(names),
             Expr::Literal(value) => Expr::Literal(value),
             Expr::BinaryExpr { left, op, right } => Expr::BinaryExpr {
@@ -704,6 +884,19 @@ impl Expr {
                 args: rewrite_vec(args, rewriter)?,
                 fun,
             },
+            Expr::WindowFunction {
+                args,
+                fun,
+                partition_by,
+                order_by,
+                window_frame,
+            } => Expr::WindowFunction {
+                args: rewrite_vec(args, rewriter)?,
+                fun,
+                partition_by: rewrite_vec(partition_by, rewriter)?,
+                order_by: rewrite_vec(order_by, rewriter)?,
+                window_frame,
+            },
             Expr::AggregateFunction {
                 args,
                 fun,
@@ -731,6 +924,14 @@ impl Expr {
 
         // now rewrite this expression itself
         rewriter.mutate(expr)
+    }
+}
+
+impl Not for Expr {
+    type Output = Self;
+
+    fn not(self) -> Self::Output {
+        Expr::Not(Box::new(self))
     }
 }
 
@@ -936,9 +1137,142 @@ pub fn or(left: Expr, right: Expr) -> Expr {
     }
 }
 
-/// Create a column expression based on a column name
-pub fn col(name: &str) -> Expr {
-    Expr::Column(name.to_owned())
+/// Create a column expression based on a qualified or unqualified column name
+pub fn col(ident: &str) -> Expr {
+    Expr::Column(ident.into())
+}
+
+/// Convert an expression into Column expression if it's already provided as input plan.
+///
+/// For example, it rewrites:
+///
+/// ```ignore
+/// .aggregate(vec![col("c1")], vec![sum(col("c2"))])?
+/// .project(vec![col("c1"), sum(col("c2"))?
+/// ```
+///
+/// Into:
+///
+/// ```ignore
+/// .aggregate(vec![col("c1")], vec![sum(col("c2"))])?
+/// .project(vec![col("c1"), col("SUM(#c2)")?
+/// ```
+pub fn columnize_expr(e: Expr, input_schema: &DFSchema) -> Expr {
+    match e {
+        Expr::Column(_) => e,
+        Expr::Alias(inner_expr, name) => {
+            Expr::Alias(Box::new(columnize_expr(*inner_expr, input_schema)), name)
+        }
+        _ => match e.name(input_schema) {
+            Ok(name) => match input_schema.field_with_unqualified_name(&name) {
+                Ok(field) => Expr::Column(field.qualified_column()),
+                // expression not provided as input, do not convert to a column reference
+                Err(_) => e,
+            },
+            Err(_) => e,
+        },
+    }
+}
+
+/// Recursively replace all Column expressions in a given expression tree with Column expressions
+/// provided by the hash map argument.
+pub fn replace_col(e: Expr, replace_map: &HashMap<&Column, &Column>) -> Result<Expr> {
+    struct ColumnReplacer<'a> {
+        replace_map: &'a HashMap<&'a Column, &'a Column>,
+    }
+
+    impl<'a> ExprRewriter for ColumnReplacer<'a> {
+        fn mutate(&mut self, expr: Expr) -> Result<Expr> {
+            if let Expr::Column(c) = &expr {
+                match self.replace_map.get(c) {
+                    Some(new_c) => Ok(Expr::Column((*new_c).to_owned())),
+                    None => Ok(expr),
+                }
+            } else {
+                Ok(expr)
+            }
+        }
+    }
+
+    e.rewrite(&mut ColumnReplacer { replace_map })
+}
+
+/// Recursively call [`Column::normalize`] on all Column expressions
+/// in the `expr` expression tree.
+pub fn normalize_col(expr: Expr, plan: &LogicalPlan) -> Result<Expr> {
+    normalize_col_with_schemas(expr, &plan.all_schemas(), &plan.using_columns()?)
+}
+
+/// Recursively call [`Column::normalize`] on all Column expressions
+/// in the `expr` expression tree.
+fn normalize_col_with_schemas(
+    expr: Expr,
+    schemas: &[&Arc<DFSchema>],
+    using_columns: &[HashSet<Column>],
+) -> Result<Expr> {
+    struct ColumnNormalizer<'a> {
+        schemas: &'a [&'a Arc<DFSchema>],
+        using_columns: &'a [HashSet<Column>],
+    }
+
+    impl<'a> ExprRewriter for ColumnNormalizer<'a> {
+        fn mutate(&mut self, expr: Expr) -> Result<Expr> {
+            if let Expr::Column(c) = expr {
+                Ok(Expr::Column(c.normalize_with_schemas(
+                    self.schemas,
+                    self.using_columns,
+                )?))
+            } else {
+                Ok(expr)
+            }
+        }
+    }
+
+    expr.rewrite(&mut ColumnNormalizer {
+        schemas,
+        using_columns,
+    })
+}
+
+/// Recursively normalize all Column expressions in a list of expression trees
+#[inline]
+pub fn normalize_cols(
+    exprs: impl IntoIterator<Item = Expr>,
+    plan: &LogicalPlan,
+) -> Result<Vec<Expr>> {
+    exprs.into_iter().map(|e| normalize_col(e, plan)).collect()
+}
+
+/// Recursively 'unnormalize' (remove all qualifiers) from an
+/// expression tree.
+///
+/// For example, if there were expressions like `foo.bar` this would
+/// rewrite it to just `bar`.
+pub fn unnormalize_col(expr: Expr) -> Expr {
+    struct RemoveQualifier {}
+
+    impl ExprRewriter for RemoveQualifier {
+        fn mutate(&mut self, expr: Expr) -> Result<Expr> {
+            if let Expr::Column(col) = expr {
+                //let Column { relation: _, name } = col;
+                Ok(Expr::Column(Column {
+                    relation: None,
+                    name: col.name,
+                }))
+            } else {
+                Ok(expr)
+            }
+        }
+    }
+
+    expr.rewrite(&mut RemoveQualifier {})
+        .expect("Unnormalize is infallable")
+}
+
+/// Recursively un-normalize all Column expressions in a list of expression trees
+#[inline]
+pub fn unnormalize_cols(exprs: impl IntoIterator<Item = Expr>) -> Vec<Expr> {
+    exprs.into_iter().map(unnormalize_col).collect()
 }
 
 /// Create an expression to represent the min() aggregate function
@@ -1029,8 +1363,8 @@ impl Literal for ScalarValue {
 }
 
 macro_rules! make_literal {
-    ($TYPE:ty, $SCALAR:ident) => {
-        #[allow(missing_docs)]
+    ($TYPE:ty, $SCALAR:ident, $DOC: expr) => {
+        #[doc = $DOC]
         impl Literal for $TYPE {
             fn lit(&self) -> Expr {
                 Expr::Literal(ScalarValue::$SCALAR(Some(self.clone())))
@@ -1039,27 +1373,55 @@ macro_rules! make_literal {
     };
 }
 
-make_literal!(bool, Boolean);
-make_literal!(f32, Float32);
-make_literal!(f64, Float64);
-make_literal!(i8, Int8);
-make_literal!(i16, Int16);
-make_literal!(i32, Int32);
-make_literal!(i64, Int64);
-make_literal!(u8, UInt8);
-make_literal!(u16, UInt16);
-make_literal!(u32, UInt32);
-make_literal!(u64, UInt64);
+make_literal!(bool, Boolean, "literal expression containing a bool");
+make_literal!(f32, Float32, "literal expression containing an f32");
+make_literal!(f64, Float64, "literal expression containing an f64");
+make_literal!(i8, Int8, "literal expression containing an i8");
+make_literal!(i16, Int16, "literal expression containing an i16");
+make_literal!(i32, Int32, "literal expression containing an i32");
+make_literal!(i64, Int64, "literal expression containing an i64");
+make_literal!(u8, UInt8, "literal expression containing a u8");
+make_literal!(u16, UInt16, "literal expression containing a u16");
+make_literal!(u32, UInt32, "literal expression containing a u32");
+make_literal!(u64, UInt64, "literal expression containing a u64");
 
 /// Create a literal expression
 pub fn lit<T: Literal>(n: T) -> Expr {
     n.lit()
 }
 
+/// Concatenates the text representations of all the arguments. NULL arguments are ignored.
+pub fn concat(args: &[Expr]) -> Expr {
+    Expr::ScalarFunction {
+        fun: functions::BuiltinScalarFunction::Concat,
+        args: args.to_vec(),
+    }
+}
+
+/// Concatenates all but the first argument, with separators.
+/// The first argument is used as the separator string, and should not be NULL.
+/// Other NULL arguments are ignored.
+pub fn concat_ws(sep: impl Into<String>, values: &[Expr]) -> Expr {
+    let mut args = vec![lit(sep.into())];
+    args.extend_from_slice(values);
+    Expr::ScalarFunction {
+        fun: functions::BuiltinScalarFunction::ConcatWithSeparator,
+        args,
+    }
+}
+
+/// Returns a random value in the range 0.0 <= x < 1.0
+pub fn random() -> Expr {
+    Expr::ScalarFunction {
+        fun: functions::BuiltinScalarFunction::Random,
+        args: vec![],
+    }
+}
+
 /// Create an convenience function representing a unary scalar function
 macro_rules! unary_scalar_expr {
     ($ENUM:ident, $FUNC:ident) => {
-        #[allow(missing_docs)]
+        #[doc = "this scalar function is not documented yet"]
         pub fn $FUNC(e: Expr) -> Expr {
             Expr::ScalarFunction {
                 fun: functions::BuiltinScalarFunction::$ENUM,
@@ -1069,7 +1431,20 @@ macro_rules! unary_scalar_expr {
     };
 }
 
-// generate methods for creating the supported unary expressions
+/// Create an convenience function representing a /binaryunary scalar function
+macro_rules! binary_scalar_expr {
+    ($ENUM:ident, $FUNC:ident) => {
+        #[doc = "this scalar function is not documented yet"]
+        pub fn $FUNC(arg1: Expr, arg2: Expr) -> Expr {
+            Expr::ScalarFunction {
+                fun: functions::BuiltinScalarFunction::$ENUM,
+                args: vec![arg1, arg2],
+            }
+        }
+    };
+}
+
+// generate methods for creating the supported unary/binary expressions
 
 // math functions
 unary_scalar_expr!(Sqrt, sqrt);
@@ -1081,6 +1456,7 @@ unary_scalar_expr!(Acos, acos);
 unary_scalar_expr!(Atan, atan);
 unary_scalar_expr!(Floor, floor);
 unary_scalar_expr!(Ceil, ceil);
+unary_scalar_expr!(Now, now);
 unary_scalar_expr!(Round, round);
 unary_scalar_expr!(Trunc, trunc);
 unary_scalar_expr!(Abs, abs);
@@ -1097,8 +1473,6 @@ unary_scalar_expr!(Btrim, btrim);
 unary_scalar_expr!(CharacterLength, character_length);
 unary_scalar_expr!(CharacterLength, length);
 unary_scalar_expr!(Chr, chr);
-unary_scalar_expr!(Concat, concat);
-unary_scalar_expr!(ConcatWithSeparator, concat_ws);
 unary_scalar_expr!(InitCap, initcap);
 unary_scalar_expr!(Left, left);
 unary_scalar_expr!(Lower, lower);
@@ -1127,6 +1501,10 @@ unary_scalar_expr!(Translate, translate);
 unary_scalar_expr!(Trim, trim);
 unary_scalar_expr!(Upper, upper);
 
+// date functions
+binary_scalar_expr!(DatePart, date_part);
+binary_scalar_expr!(DateTrunc, date_trunc);
+
 /// returns an array of fixed size with each argument on it.
 pub fn array(args: Vec<Expr>) -> Expr {
     Expr::ScalarFunction {
@@ -1151,7 +1529,7 @@ pub fn create_udf(
 }
 
 /// Creates a new UDAF with a specific signature, state type and return type.
-/// The signature and state type must match the `Acumulator's implementation`.
+/// The signature and state type must match the `Accumulator's implementation`.
 #[allow(clippy::rc_buffer)]
 pub fn create_udaf(
     name: &str,
@@ -1189,7 +1567,7 @@ impl fmt::Debug for Expr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Expr::Alias(expr, alias) => write!(f, "{:?} AS {}", expr, alias),
-            Expr::Column(name) => write!(f, "#{}", name),
+            Expr::Column(c) => write!(f, "{}", c),
             Expr::ScalarVariable(var_names) => write!(f, "{}", var_names.join(".")),
             Expr::Literal(v) => write!(f, "{:?}", v),
             Expr::Case {
@@ -1244,6 +1622,31 @@ impl fmt::Debug for Expr {
             }
             Expr::ScalarUDF { fun, ref args, .. } => {
                 fmt_function(f, &fun.name, false, args)
+            }
+            Expr::WindowFunction {
+                fun,
+                args,
+                partition_by,
+                order_by,
+                window_frame,
+            } => {
+                fmt_function(f, &fun.to_string(), false, args)?;
+                if !partition_by.is_empty() {
+                    write!(f, " PARTITION BY {:?}", partition_by)?;
+                }
+                if !order_by.is_empty() {
+                    write!(f, " ORDER BY {:?}", order_by)?;
+                }
+                if let Some(window_frame) = window_frame {
+                    write!(
+                        f,
+                        " {} BETWEEN {} AND {}",
+                        window_frame.units,
+                        window_frame.start_bound,
+                        window_frame.end_bound
+                    )?;
+                }
+                Ok(())
             }
             Expr::AggregateFunction {
                 fun,
@@ -1304,7 +1707,7 @@ fn create_function_name(
 fn create_name(e: &Expr, input_schema: &DFSchema) -> Result<String> {
     match e {
         Expr::Alias(_, name) => Ok(name.clone()),
-        Expr::Column(name) => Ok(name.clone()),
+        Expr::Column(c) => Ok(c.flat_name()),
         Expr::ScalarVariable(variable_names) => Ok(variable_names.join(".")),
         Expr::Literal(value) => Ok(format!("{:?}", value)),
         Expr::BinaryExpr { left, op, right } => {
@@ -1360,6 +1763,30 @@ fn create_name(e: &Expr, input_schema: &DFSchema) -> Result<String> {
         Expr::ScalarUDF { fun, args, .. } => {
             create_function_name(&fun.name, false, args, input_schema)
         }
+        Expr::WindowFunction {
+            fun,
+            args,
+            window_frame,
+            partition_by,
+            order_by,
+        } => {
+            let mut parts: Vec<String> = vec![create_function_name(
+                &fun.to_string(),
+                false,
+                args,
+                input_schema,
+            )?];
+            if !partition_by.is_empty() {
+                parts.push(format!("PARTITION BY {:?}", partition_by));
+            }
+            if !order_by.is_empty() {
+                parts.push(format!("ORDER BY {:?}", order_by));
+            }
+            if let Some(window_frame) = window_frame {
+                parts.push(format!("{}", window_frame));
+            }
+            Ok(parts.join(" "))
+        }
         Expr::AggregateFunction {
             fun,
             distinct,
@@ -1387,7 +1814,7 @@ fn create_name(e: &Expr, input_schema: &DFSchema) -> Result<String> {
             }
         }
         other => Err(DataFusionError::NotImplemented(format!(
-            "Physical plan does not support logical expression {:?}",
+            "Create name does not support logical expression {:?}",
             other
         ))),
     }
@@ -1442,8 +1869,8 @@ mod tests {
 
     #[test]
     fn filter_is_null_and_is_not_null() {
-        let col_null = Expr::Column("col1".to_string());
-        let col_not_null = Expr::Column("col2".to_string());
+        let col_null = col("col1");
+        let col_not_null = col("col2");
         assert_eq!(format!("{:?}", col_null.is_null()), "#col1 IS NULL");
         assert_eq!(
             format!("{:?}", col_not_null.is_not_null()),
@@ -1485,21 +1912,163 @@ mod tests {
     impl ExprRewriter for FooBarRewriter {
         fn mutate(&mut self, expr: Expr) -> Result<Expr> {
             match expr {
-                Expr::Literal(scalar) => {
-                    if let ScalarValue::Utf8(Some(utf8_val)) = scalar {
-                        let utf8_val = if utf8_val == "foo" {
-                            "bar".to_string()
-                        } else {
-                            utf8_val
-                        };
-                        Ok(lit(utf8_val))
+                Expr::Literal(ScalarValue::Utf8(Some(utf8_val))) => {
+                    let utf8_val = if utf8_val == "foo" {
+                        "bar".to_string()
                     } else {
-                        Ok(Expr::Literal(scalar))
-                    }
+                        utf8_val
+                    };
+                    Ok(lit(utf8_val))
                 }
                 // otherwise, return the expression unchanged
                 expr => Ok(expr),
             }
         }
+    }
+
+    #[test]
+    fn normalize_cols() {
+        let expr = col("a") + col("b") + col("c");
+
+        // Schemas with some matching and some non matching cols
+        let schema_a =
+            DFSchema::new(vec![make_field("tableA", "a"), make_field("tableA", "aa")])
+                .unwrap();
+        let schema_c =
+            DFSchema::new(vec![make_field("tableC", "cc"), make_field("tableC", "c")])
+                .unwrap();
+        let schema_b = DFSchema::new(vec![make_field("tableB", "b")]).unwrap();
+        // non matching
+        let schema_f =
+            DFSchema::new(vec![make_field("tableC", "f"), make_field("tableC", "ff")])
+                .unwrap();
+        let schemas = vec![schema_c, schema_f, schema_b, schema_a]
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>();
+        let schemas = schemas.iter().collect::<Vec<_>>();
+
+        let normalized_expr = normalize_col_with_schemas(expr, &schemas, &[]).unwrap();
+        assert_eq!(
+            normalized_expr,
+            col("tableA.a") + col("tableB.b") + col("tableC.c")
+        );
+    }
+
+    #[test]
+    fn normalize_cols_priority() {
+        let expr = col("a") + col("b");
+        // Schemas with multiple matches for column a, first takes priority
+        let schema_a = DFSchema::new(vec![make_field("tableA", "a")]).unwrap();
+        let schema_b = DFSchema::new(vec![make_field("tableB", "b")]).unwrap();
+        let schema_a2 = DFSchema::new(vec![make_field("tableA2", "a")]).unwrap();
+        let schemas = vec![schema_a2, schema_b, schema_a]
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>();
+        let schemas = schemas.iter().collect::<Vec<_>>();
+
+        let normalized_expr = normalize_col_with_schemas(expr, &schemas, &[]).unwrap();
+        assert_eq!(normalized_expr, col("tableA2.a") + col("tableB.b"));
+    }
+
+    #[test]
+    fn normalize_cols_non_exist() {
+        // test normalizing columns when the name doesn't exist
+        let expr = col("a") + col("b");
+        let schema_a = DFSchema::new(vec![make_field("tableA", "a")]).unwrap();
+        let schemas = vec![schema_a].into_iter().map(Arc::new).collect::<Vec<_>>();
+        let schemas = schemas.iter().collect::<Vec<_>>();
+
+        let error = normalize_col_with_schemas(expr, &schemas, &[])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Error during planning: Column #b not found in provided schemas"
+        );
+    }
+
+    #[test]
+    fn unnormalize_cols() {
+        let expr = col("tableA.a") + col("tableB.b");
+        let unnormalized_expr = unnormalize_col(expr);
+        assert_eq!(unnormalized_expr, col("a") + col("b"));
+    }
+
+    fn make_field(relation: &str, column: &str) -> DFField {
+        DFField::new(Some(relation), column, DataType::Int8, false)
+    }
+
+    #[test]
+    fn test_not() {
+        assert_eq!(lit(1).not(), !lit(1));
+    }
+
+    macro_rules! test_unary_scalar_expr {
+        ($ENUM:ident, $FUNC:ident) => {{
+            if let Expr::ScalarFunction { fun, args } = $FUNC(col("tableA.a")) {
+                let name = functions::BuiltinScalarFunction::$ENUM;
+                assert_eq!(name, fun);
+                assert_eq!(1, args.len());
+            } else {
+                assert!(false, "unexpected");
+            }
+        }};
+    }
+
+    #[test]
+    fn scalar_function_definitions() {
+        test_unary_scalar_expr!(Sqrt, sqrt);
+        test_unary_scalar_expr!(Sin, sin);
+        test_unary_scalar_expr!(Cos, cos);
+        test_unary_scalar_expr!(Tan, tan);
+        test_unary_scalar_expr!(Asin, asin);
+        test_unary_scalar_expr!(Acos, acos);
+        test_unary_scalar_expr!(Atan, atan);
+        test_unary_scalar_expr!(Floor, floor);
+        test_unary_scalar_expr!(Ceil, ceil);
+        test_unary_scalar_expr!(Now, now);
+        test_unary_scalar_expr!(Round, round);
+        test_unary_scalar_expr!(Trunc, trunc);
+        test_unary_scalar_expr!(Abs, abs);
+        test_unary_scalar_expr!(Signum, signum);
+        test_unary_scalar_expr!(Exp, exp);
+        test_unary_scalar_expr!(Log2, log2);
+        test_unary_scalar_expr!(Log10, log10);
+        test_unary_scalar_expr!(Ln, ln);
+        test_unary_scalar_expr!(Ascii, ascii);
+        test_unary_scalar_expr!(BitLength, bit_length);
+        test_unary_scalar_expr!(Btrim, btrim);
+        test_unary_scalar_expr!(CharacterLength, character_length);
+        test_unary_scalar_expr!(CharacterLength, length);
+        test_unary_scalar_expr!(Chr, chr);
+        test_unary_scalar_expr!(InitCap, initcap);
+        test_unary_scalar_expr!(Left, left);
+        test_unary_scalar_expr!(Lower, lower);
+        test_unary_scalar_expr!(Lpad, lpad);
+        test_unary_scalar_expr!(Ltrim, ltrim);
+        test_unary_scalar_expr!(MD5, md5);
+        test_unary_scalar_expr!(OctetLength, octet_length);
+        test_unary_scalar_expr!(RegexpMatch, regexp_match);
+        test_unary_scalar_expr!(RegexpReplace, regexp_replace);
+        test_unary_scalar_expr!(Replace, replace);
+        test_unary_scalar_expr!(Repeat, repeat);
+        test_unary_scalar_expr!(Reverse, reverse);
+        test_unary_scalar_expr!(Right, right);
+        test_unary_scalar_expr!(Rpad, rpad);
+        test_unary_scalar_expr!(Rtrim, rtrim);
+        test_unary_scalar_expr!(SHA224, sha224);
+        test_unary_scalar_expr!(SHA256, sha256);
+        test_unary_scalar_expr!(SHA384, sha384);
+        test_unary_scalar_expr!(SHA512, sha512);
+        test_unary_scalar_expr!(SplitPart, split_part);
+        test_unary_scalar_expr!(StartsWith, starts_with);
+        test_unary_scalar_expr!(Strpos, strpos);
+        test_unary_scalar_expr!(Substr, substr);
+        test_unary_scalar_expr!(ToHex, to_hex);
+        test_unary_scalar_expr!(Translate, translate);
+        test_unary_scalar_expr!(Trim, trim);
+        test_unary_scalar_expr!(Upper, upper);
     }
 }

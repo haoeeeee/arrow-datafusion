@@ -18,8 +18,8 @@
 [workspace]
 members = [
     "datafusion",
-    "datafusion-cli",
-    "datafusion-examples",
+    # "datafusion-cli",
+    # "datafusion-examples",
     # "benchmarks",
     # "ballista/rust/client",
     # "ballista/rust/core",

@@ -20,40 +20,14 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::arrow::datatypes::SchemaRef;
 use crate::error::Result;
 use crate::logical_plan::Expr;
 use crate::physical_plan::ExecutionPlan;
-use crate::{arrow::datatypes::SchemaRef, scalar::ScalarValue};
-
-use serde::{Deserialize, Serialize};
-
-/// This table statistics are estimates.
-/// It can not be used directly in the precise compute
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Statistics {
-    /// The number of table rows
-    pub num_rows: Option<usize>,
-    /// total byte of the table rows
-    pub total_byte_size: Option<usize>,
-    /// Statistics on a column level
-    pub column_statistics: Option<Vec<ColumnStatistics>>,
-}
-/// This table statistics are estimates about column
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ColumnStatistics {
-    /// Number of null values on column
-    pub null_count: Option<usize>,
-    /// Maximum value of column
-    pub max_value: Option<ScalarValue>,
-    /// Minimum value of column
-    pub min_value: Option<ScalarValue>,
-    /// Number of distinct values
-    pub distinct_count: Option<usize>,
-}
 
 /// Indicates whether and how a filter expression can be handled by a
 /// TableProvider for table scans.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TableProviderFilterPushDown {
     /// The expression cannot be used by the provider.
     Unsupported,
@@ -69,7 +43,7 @@ pub enum TableProviderFilterPushDown {
 }
 
 /// Indicates the type of this table for metadata/catalog purposes.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TableType {
     /// An ordinary physical table.
     Base,
@@ -108,10 +82,6 @@ pub trait TableProvider: Sync + Send {
         // The datasource should return *at least* this number of rows if available.
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>>;
-
-    /// Returns the table Statistics
-    /// Statistics should be optional because not all data sources can provide statistics.
-    fn statistics(&self) -> Statistics;
 
     /// Tests whether the table provider can make use of a filter expression
     /// to optimise data retrieval.

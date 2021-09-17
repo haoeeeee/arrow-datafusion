@@ -17,29 +17,23 @@
 //! This module contains the  `LogicalPlan` enum that describes queries
 //! via a logical query plan.
 
+use super::display::{GraphvizVisitor, IndentVisitor};
+use super::expr::{Column, Expr};
+use super::extension::UserDefinedLogicalNode;
+use crate::datasource::TableProvider;
+use crate::error::DataFusionError;
+use crate::logical_plan::dfschema::DFSchemaRef;
+use crate::sql::parser::FileType;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use std::{
-    cmp::min,
+    collections::HashSet,
     fmt::{self, Display},
     sync::Arc,
 };
-
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-
-use crate::datasource::TableProvider;
-use crate::sql::parser::FileType;
-
-use super::expr::Expr;
-use super::extension::UserDefinedLogicalNode;
-use super::{
-    col,
-    display::{GraphvizVisitor, IndentVisitor},
-};
-use crate::logical_plan::dfschema::DFSchemaRef;
-
 use serde::{Deserialize, Serialize};
 
 /// Join type
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub enum JoinType {
     /// Inner Join
     Inner,
@@ -49,6 +43,19 @@ pub enum JoinType {
     Right,
     /// Full Join
     Full,
+    /// Semi Join
+    Semi,
+    /// Anti Join
+    Anti,
+}
+
+/// Join constraint
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub enum JoinConstraint {
+    /// Join ON
+    On,
+    /// Join USING
+    Using,
 }
 
 /// A LogicalPlan represents the different types of relational
@@ -85,6 +92,15 @@ pub enum LogicalPlan {
         /// The incoming logical plan
         input: Arc<LogicalPlan>,
     },
+    /// Window its input based on a set of window spec and window function (e.g. SUM or RANK)
+    Window {
+        /// The incoming logical plan
+        input: Arc<LogicalPlan>,
+        /// The window function expression
+        window_expr: Vec<Expr>,
+        /// The schema description of the window output
+        schema: DFSchemaRef,
+    },
     /// Aggregates its input based on a set of grouping and aggregate
     /// expressions (e.g. SUM).
     Aggregate {
@@ -111,9 +127,11 @@ pub enum LogicalPlan {
         /// Right input
         right: Arc<LogicalPlan>,
         /// Equijoin clause expressed as pairs of (left, right) join columns
-        on: Vec<(String, String)>,
+        on: Vec<(Column, Column)>,
         /// Join type
         join_type: JoinType,
+        /// Join constraint
+        join_constraint: JoinConstraint,
         /// The output schema, containing fields from the left and right inputs
         schema: DFSchemaRef,
     },
@@ -196,6 +214,16 @@ pub enum LogicalPlan {
         /// The output schema of the explain (2 columns of text)
         schema: DFSchemaRef,
     },
+    /// Runs the actual plan, and then prints the physical plan with
+    /// with execution metrics.
+    Analyze {
+        /// Should extra detail be included?
+        verbose: bool,
+        /// The logical plan that is being EXPLAIN ANALYZE'd
+        input: Arc<LogicalPlan>,
+        /// The output schema of the explain (2 columns of text)
+        schema: DFSchemaRef,
+    },
     /// Extension operator defined outside of DataFusion
     Extension {
         /// The runtime extension operator
@@ -207,22 +235,24 @@ impl LogicalPlan {
     /// Get a reference to the logical plan's schema
     pub fn schema(&self) -> &DFSchemaRef {
         match self {
-            LogicalPlan::EmptyRelation { schema, .. } => &schema,
+            LogicalPlan::EmptyRelation { schema, .. } => schema,
             LogicalPlan::TableScan {
                 projected_schema, ..
-            } => &projected_schema,
-            LogicalPlan::Projection { schema, .. } => &schema,
+            } => projected_schema,
+            LogicalPlan::Projection { schema, .. } => schema,
             LogicalPlan::Filter { input, .. } => input.schema(),
-            LogicalPlan::Aggregate { schema, .. } => &schema,
+            LogicalPlan::Window { schema, .. } => schema,
+            LogicalPlan::Aggregate { schema, .. } => schema,
             LogicalPlan::Sort { input, .. } => input.schema(),
-            LogicalPlan::Join { schema, .. } => &schema,
-            LogicalPlan::CrossJoin { schema, .. } => &schema,
+            LogicalPlan::Join { schema, .. } => schema,
+            LogicalPlan::CrossJoin { schema, .. } => schema,
             LogicalPlan::Repartition { input, .. } => input.schema(),
             LogicalPlan::Limit { input, .. } => input.schema(),
-            LogicalPlan::CreateExternalTable { schema, .. } => &schema,
-            LogicalPlan::Explain { schema, .. } => &schema,
-            LogicalPlan::Extension { node } => &node.schema(),
-            LogicalPlan::Union { schema, .. } => &schema,
+            LogicalPlan::CreateExternalTable { schema, .. } => schema,
+            LogicalPlan::Explain { schema, .. } => schema,
+            LogicalPlan::Analyze { schema, .. } => schema,
+            LogicalPlan::Extension { node } => node.schema(),
+            LogicalPlan::Union { schema, .. } => schema,
         }
     }
 
@@ -231,11 +261,12 @@ impl LogicalPlan {
         match self {
             LogicalPlan::TableScan {
                 projected_schema, ..
-            } => vec![&projected_schema],
-            LogicalPlan::Aggregate { input, schema, .. }
+            } => vec![projected_schema],
+            LogicalPlan::Window { input, schema, .. }
+            | LogicalPlan::Aggregate { input, schema, .. }
             | LogicalPlan::Projection { input, schema, .. } => {
                 let mut schemas = input.all_schemas();
-                schemas.insert(0, &schema);
+                schemas.insert(0, schema);
                 schemas
             }
             LogicalPlan::Join {
@@ -251,16 +282,17 @@ impl LogicalPlan {
             } => {
                 let mut schemas = left.all_schemas();
                 schemas.extend(right.all_schemas());
-                schemas.insert(0, &schema);
+                schemas.insert(0, schema);
                 schemas
             }
             LogicalPlan::Union { schema, .. } => {
                 vec![schema]
             }
-            LogicalPlan::Extension { node } => vec![&node.schema()],
+            LogicalPlan::Extension { node } => vec![node.schema()],
             LogicalPlan::Explain { schema, .. }
+            | LogicalPlan::Analyze { schema, .. }
             | LogicalPlan::EmptyRelation { schema, .. }
-            | LogicalPlan::CreateExternalTable { schema, .. } => vec![&schema],
+            | LogicalPlan::CreateExternalTable { schema, .. } => vec![schema],
             LogicalPlan::Limit { input, .. }
             | LogicalPlan::Repartition { input, .. }
             | LogicalPlan::Sort { input, .. }
@@ -290,18 +322,16 @@ impl LogicalPlan {
                 Partitioning::Hash(expr, _) => expr.clone(),
                 _ => vec![],
             },
+            LogicalPlan::Window { window_expr, .. } => window_expr.clone(),
             LogicalPlan::Aggregate {
                 group_expr,
                 aggr_expr,
                 ..
-            } => {
-                let mut result = group_expr.clone();
-                result.extend(aggr_expr.clone());
-                result
-            }
-            LogicalPlan::Join { on, .. } => {
-                on.iter().flat_map(|(l, r)| vec![col(l), col(r)]).collect()
-            }
+            } => group_expr.iter().chain(aggr_expr.iter()).cloned().collect(),
+            LogicalPlan::Join { on, .. } => on
+                .iter()
+                .flat_map(|(l, r)| vec![Expr::Column(l.clone()), Expr::Column(r.clone())])
+                .collect(),
             LogicalPlan::Sort { expr, .. } => expr.clone(),
             LogicalPlan::Extension { node } => node.expressions(),
             // plans without expressions
@@ -310,6 +340,7 @@ impl LogicalPlan {
             | LogicalPlan::Limit { .. }
             | LogicalPlan::CreateExternalTable { .. }
             | LogicalPlan::CrossJoin { .. }
+            | LogicalPlan::Analyze { .. }
             | LogicalPlan::Explain { .. }
             | LogicalPlan::Union { .. } => {
                 vec![]
@@ -324,6 +355,7 @@ impl LogicalPlan {
             LogicalPlan::Projection { input, .. } => vec![input],
             LogicalPlan::Filter { input, .. } => vec![input],
             LogicalPlan::Repartition { input, .. } => vec![input],
+            LogicalPlan::Window { input, .. } => vec![input],
             LogicalPlan::Aggregate { input, .. } => vec![input],
             LogicalPlan::Sort { input, .. } => vec![input],
             LogicalPlan::Join { left, right, .. } => vec![left, right],
@@ -331,12 +363,48 @@ impl LogicalPlan {
             LogicalPlan::Limit { input, .. } => vec![input],
             LogicalPlan::Extension { node } => node.inputs(),
             LogicalPlan::Union { inputs, .. } => inputs.iter().collect(),
+            LogicalPlan::Explain { plan, .. } => vec![plan],
+            LogicalPlan::Analyze { input: plan, .. } => vec![plan],
             // plans without inputs
             LogicalPlan::TableScan { .. }
             | LogicalPlan::EmptyRelation { .. }
-            | LogicalPlan::CreateExternalTable { .. }
-            | LogicalPlan::Explain { .. } => vec![],
+            | LogicalPlan::CreateExternalTable { .. } => vec![],
         }
+    }
+
+    /// returns all `Using` join columns in a logical plan
+    pub fn using_columns(&self) -> Result<Vec<HashSet<Column>>, DataFusionError> {
+        struct UsingJoinColumnVisitor {
+            using_columns: Vec<HashSet<Column>>,
+        }
+
+        impl PlanVisitor for UsingJoinColumnVisitor {
+            type Error = DataFusionError;
+
+            fn pre_visit(&mut self, plan: &LogicalPlan) -> Result<bool, Self::Error> {
+                if let LogicalPlan::Join {
+                    join_constraint: JoinConstraint::Using,
+                    on,
+                    ..
+                } = plan
+                {
+                    self.using_columns.push(
+                        on.iter()
+                            .map(|entry| [&entry.0, &entry.1])
+                            .flatten()
+                            .cloned()
+                            .collect::<HashSet<Column>>(),
+                    );
+                }
+                Ok(true)
+            }
+        }
+
+        let mut visitor = UsingJoinColumnVisitor {
+            using_columns: vec![],
+        };
+        self.accept(&mut visitor)?;
+        Ok(visitor.using_columns)
     }
 }
 
@@ -417,6 +485,7 @@ impl LogicalPlan {
             LogicalPlan::Projection { input, .. } => input.accept(visitor)?,
             LogicalPlan::Filter { input, .. } => input.accept(visitor)?,
             LogicalPlan::Repartition { input, .. } => input.accept(visitor)?,
+            LogicalPlan::Window { input, .. } => input.accept(visitor)?,
             LogicalPlan::Aggregate { input, .. } => input.accept(visitor)?,
             LogicalPlan::Sort { input, .. } => input.accept(visitor)?,
             LogicalPlan::Join { left, right, .. }
@@ -440,11 +509,12 @@ impl LogicalPlan {
                 }
                 true
             }
+            LogicalPlan::Explain { plan, .. } => plan.accept(visitor)?,
+            LogicalPlan::Analyze { input: plan, .. } => plan.accept(visitor)?,
             // plans without inputs
             LogicalPlan::TableScan { .. }
             | LogicalPlan::EmptyRelation { .. }
-            | LogicalPlan::CreateExternalTable { .. }
-            | LogicalPlan::Explain { .. } => true,
+            | LogicalPlan::CreateExternalTable { .. } => true,
         };
         if !recurse {
             return Ok(false);
@@ -464,9 +534,9 @@ impl LogicalPlan {
     /// per node. For example:
     ///
     /// ```text
-    /// Projection: #id
-    ///    Filter: #state Eq Utf8(\"CO\")\
-    ///       CsvScan: employee.csv projection=Some([0, 3])
+    /// Projection: #employee.id
+    ///    Filter: #employee.state Eq Utf8(\"CO\")\
+    ///       CsvScan: employee projection=Some([0, 3])
     /// ```
     ///
     /// ```
@@ -475,15 +545,15 @@ impl LogicalPlan {
     /// let schema = Schema::new(vec![
     ///     Field::new("id", DataType::Int32, false),
     /// ]);
-    /// let plan = LogicalPlanBuilder::scan_empty("foo.csv", &schema, None).unwrap()
+    /// let plan = LogicalPlanBuilder::scan_empty(Some("foo_csv"), &schema, None).unwrap()
     ///     .filter(col("id").eq(lit(5))).unwrap()
     ///     .build().unwrap();
     ///
     /// // Format using display_indent
     /// let display_string = format!("{}", plan.display_indent());
     ///
-    /// assert_eq!("Filter: #id Eq Int32(5)\
-    ///              \n  TableScan: foo.csv projection=None",
+    /// assert_eq!("Filter: #foo_csv.id Eq Int32(5)\
+    ///              \n  TableScan: foo_csv projection=None",
     ///             display_string);
     /// ```
     pub fn display_indent(&self) -> impl fmt::Display + '_ {
@@ -505,9 +575,9 @@ impl LogicalPlan {
     /// per node that includes the output schema. For example:
     ///
     /// ```text
-    /// Projection: #id [id:Int32]\
-    ///    Filter: #state Eq Utf8(\"CO\") [id:Int32, state:Utf8]\
-    ///      TableScan: employee.csv projection=Some([0, 3]) [id:Int32, state:Utf8]";
+    /// Projection: #employee.id [id:Int32]\
+    ///    Filter: #employee.state Eq Utf8(\"CO\") [id:Int32, state:Utf8]\
+    ///      TableScan: employee projection=Some([0, 3]) [id:Int32, state:Utf8]";
     /// ```
     ///
     /// ```
@@ -516,15 +586,15 @@ impl LogicalPlan {
     /// let schema = Schema::new(vec![
     ///     Field::new("id", DataType::Int32, false),
     /// ]);
-    /// let plan = LogicalPlanBuilder::scan_empty("foo.csv", &schema, None).unwrap()
+    /// let plan = LogicalPlanBuilder::scan_empty(Some("foo_csv"), &schema, None).unwrap()
     ///     .filter(col("id").eq(lit(5))).unwrap()
     ///     .build().unwrap();
     ///
     /// // Format using display_indent_schema
     /// let display_string = format!("{}", plan.display_indent_schema());
     ///
-    /// assert_eq!("Filter: #id Eq Int32(5) [id:Int32]\
-    ///             \n  TableScan: foo.csv projection=None [id:Int32]",
+    /// assert_eq!("Filter: #foo_csv.id Eq Int32(5) [id:Int32]\
+    ///             \n  TableScan: foo_csv projection=None [id:Int32]",
     ///             display_string);
     /// ```
     pub fn display_indent_schema(&self) -> impl fmt::Display + '_ {
@@ -556,7 +626,7 @@ impl LogicalPlan {
     /// let schema = Schema::new(vec![
     ///     Field::new("id", DataType::Int32, false),
     /// ]);
-    /// let plan = LogicalPlanBuilder::scan_empty("foo.csv", &schema, None).unwrap()
+    /// let plan = LogicalPlanBuilder::scan_empty(Some("foo.csv"), &schema, None).unwrap()
     ///     .filter(col("id").eq(lit(5))).unwrap()
     ///     .build().unwrap();
     ///
@@ -615,7 +685,7 @@ impl LogicalPlan {
     /// let schema = Schema::new(vec![
     ///     Field::new("id", DataType::Int32, false),
     /// ]);
-    /// let plan = LogicalPlanBuilder::scan_empty("foo.csv", &schema, None).unwrap()
+    /// let plan = LogicalPlanBuilder::scan_empty(Some("foo.csv"), &schema, None).unwrap()
     ///     .build().unwrap();
     ///
     /// // Format using display
@@ -638,11 +708,10 @@ impl LogicalPlan {
                         ref limit,
                         ..
                     } => {
-                        let sep = " ".repeat(min(1, table_name.len()));
                         write!(
                             f,
-                            "TableScan: {}{}projection={:?}",
-                            table_name, sep, projection
+                            "TableScan: {} projection={:?}",
+                            table_name, projection
                         )?;
 
                         if !filters.is_empty() {
@@ -669,6 +738,11 @@ impl LogicalPlan {
                         predicate: ref expr,
                         ..
                     } => write!(f, "Filter: {:?}", expr),
+                    LogicalPlan::Window {
+                        ref window_expr, ..
+                    } => {
+                        write!(f, "WindowAggr: windowExpr=[{:?}]", window_expr)
+                    }
                     LogicalPlan::Aggregate {
                         ref group_expr,
                         ref aggr_expr,
@@ -688,10 +762,21 @@ impl LogicalPlan {
                         }
                         Ok(())
                     }
-                    LogicalPlan::Join { on: ref keys, .. } => {
+                    LogicalPlan::Join {
+                        on: ref keys,
+                        join_constraint,
+                        ..
+                    } => {
                         let join_expr: Vec<String> =
                             keys.iter().map(|(l, r)| format!("{} = {}", l, r)).collect();
-                        write!(f, "Join: {}", join_expr.join(", "))
+                        match join_constraint {
+                            JoinConstraint::On => {
+                                write!(f, "Join: {}", join_expr.join(", "))
+                            }
+                            JoinConstraint::Using => {
+                                write!(f, "Join: Using {}", join_expr.join(", "))
+                            }
+                        }
                     }
                     LogicalPlan::CrossJoin { .. } => {
                         write!(f, "CrossJoin:")
@@ -721,6 +806,7 @@ impl LogicalPlan {
                         write!(f, "CreateExternalTable: {:?}", name)
                     }
                     LogicalPlan::Explain { .. } => write!(f, "Explain"),
+                    LogicalPlan::Analyze { .. } => write!(f, "Analyze"),
                     LogicalPlan::Union { .. } => write!(f, "Union"),
                     LogicalPlan::Extension { ref node } => node.fmt_for_explain(f),
                 }
@@ -740,24 +826,38 @@ impl fmt::Debug for LogicalPlan {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PlanType {
     /// The initial LogicalPlan provided to DataFusion
-    LogicalPlan,
+    InitialLogicalPlan,
     /// The LogicalPlan which results from applying an optimizer pass
     OptimizedLogicalPlan {
         /// The name of the optimizer which produced this plan
         optimizer_name: String,
     },
-    /// The physical plan, prepared for execution
-    PhysicalPlan,
+    /// The final, fully optimized LogicalPlan that was converted to a physical plan
+    FinalLogicalPlan,
+    /// The initial physical plan, prepared for execution
+    InitialPhysicalPlan,
+    /// The ExecutionPlan which results from applying an optimizer pass
+    OptimizedPhysicalPlan {
+        /// The name of the optimizer which produced this plan
+        optimizer_name: String,
+    },
+    /// The final, fully optimized physical which would be executed
+    FinalPhysicalPlan,
 }
 
-impl From<&PlanType> for String {
-    fn from(t: &PlanType) -> Self {
-        match t {
-            PlanType::LogicalPlan => "logical_plan".into(),
+impl fmt::Display for PlanType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PlanType::InitialLogicalPlan => write!(f, "initial_logical_plan"),
             PlanType::OptimizedLogicalPlan { optimizer_name } => {
-                format!("logical_plan after {}", optimizer_name)
+                write!(f, "logical_plan after {}", optimizer_name)
             }
-            PlanType::PhysicalPlan => "physical_plan".into(),
+            PlanType::FinalLogicalPlan => write!(f, "logical_plan"),
+            PlanType::InitialPhysicalPlan => write!(f, "initial_physical_plan"),
+            PlanType::OptimizedPhysicalPlan { optimizer_name } => {
+                write!(f, "physical_plan after {}", optimizer_name)
+            }
+            PlanType::FinalPhysicalPlan => write!(f, "physical_plan"),
         }
     }
 }
@@ -785,7 +885,22 @@ impl StringifiedPlan {
     /// returns true if this plan should be displayed. Generally
     /// `verbose_mode = true` will display all available plans
     pub fn should_display(&self, verbose_mode: bool) -> bool {
-        self.plan_type == PlanType::LogicalPlan || verbose_mode
+        match self.plan_type {
+            PlanType::FinalLogicalPlan | PlanType::FinalPhysicalPlan => true,
+            _ => verbose_mode,
+        }
+    }
+}
+
+/// Trait for something that can be formatted as a stringified plan
+pub trait ToStringifiedPlan {
+    /// Create a stringified plan with the specified type
+    fn to_stringified(&self, plan_type: PlanType) -> StringifiedPlan;
+}
+
+impl ToStringifiedPlan for LogicalPlan {
+    fn to_stringified(&self, plan_type: PlanType) -> StringifiedPlan {
+        StringifiedPlan::new(plan_type, self.display_indent().to_string())
     }
 }
 
@@ -806,7 +921,7 @@ mod tests {
 
     fn display_plan() -> LogicalPlan {
         LogicalPlanBuilder::scan_empty(
-            "employee.csv",
+            Some("employee_csv"),
             &employee_schema(),
             Some(vec![0, 3]),
         )
@@ -823,9 +938,9 @@ mod tests {
     fn test_display_indent() {
         let plan = display_plan();
 
-        let expected = "Projection: #id\
-        \n  Filter: #state Eq Utf8(\"CO\")\
-        \n    TableScan: employee.csv projection=Some([0, 3])";
+        let expected = "Projection: #employee_csv.id\
+        \n  Filter: #employee_csv.state Eq Utf8(\"CO\")\
+        \n    TableScan: employee_csv projection=Some([0, 3])";
 
         assert_eq!(expected, format!("{}", plan.display_indent()));
     }
@@ -834,9 +949,9 @@ mod tests {
     fn test_display_indent_schema() {
         let plan = display_plan();
 
-        let expected = "Projection: #id [id:Int32]\
-                        \n  Filter: #state Eq Utf8(\"CO\") [id:Int32, state:Utf8]\
-                        \n    TableScan: employee.csv projection=Some([0, 3]) [id:Int32, state:Utf8]";
+        let expected = "Projection: #employee_csv.id [id:Int32]\
+                        \n  Filter: #employee_csv.state Eq Utf8(\"CO\") [id:Int32, state:Utf8]\
+                        \n    TableScan: employee_csv projection=Some([0, 3]) [id:Int32, state:Utf8]";
 
         assert_eq!(expected, format!("{}", plan.display_indent_schema()));
     }
@@ -858,12 +973,12 @@ mod tests {
         );
         assert!(
             graphviz.contains(
-                r#"[shape=box label="TableScan: employee.csv projection=Some([0, 3])"]"#
+                r#"[shape=box label="TableScan: employee_csv projection=Some([0, 3])"]"#
             ),
             "\n{}",
             plan.display_graphviz()
         );
-        assert!(graphviz.contains(r#"[shape=box label="TableScan: employee.csv projection=Some([0, 3])\nSchema: [id:Int32, state:Utf8]"]"#),
+        assert!(graphviz.contains(r#"[shape=box label="TableScan: employee_csv projection=Some([0, 3])\nSchema: [id:Int32, state:Utf8]"]"#),
                 "\n{}", plan.display_graphviz());
         assert!(
             graphviz.contains(r#"// End DataFusion GraphViz Plan"#),
@@ -1108,9 +1223,12 @@ mod tests {
     }
 
     fn test_plan() -> LogicalPlan {
-        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("state", DataType::Utf8, false),
+        ]);
 
-        LogicalPlanBuilder::scan_empty("", &schema, Some(vec![0]))
+        LogicalPlanBuilder::scan_empty(None, &schema, Some(vec![0, 1]))
             .unwrap()
             .filter(col("state").eq(lit("CO")))
             .unwrap()

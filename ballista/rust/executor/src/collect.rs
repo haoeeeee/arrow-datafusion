@@ -22,12 +22,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{any::Any, pin::Pin};
 
-use arrow::datatypes::SchemaRef;
-use arrow::error::Result as ArrowResult;
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use datafusion::arrow::{
+    datatypes::SchemaRef, error::Result as ArrowResult, record_batch::RecordBatch,
+};
 use datafusion::error::DataFusionError;
-use datafusion::physical_plan::{ExecutionPlan, Partitioning, SendableRecordBatchStream};
+use datafusion::physical_plan::{
+    DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream, Statistics,
+};
 use datafusion::{error::Result, physical_plan::RecordBatchStream};
 use futures::stream::SelectAll;
 use futures::Stream;
@@ -101,6 +103,22 @@ impl ExecutionPlan for CollectExec {
             schema: self.schema(),
             select_all: Box::pin(futures::stream::select_all(streams)),
         }))
+    }
+
+    fn fmt_as(
+        &self,
+        t: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default => {
+                write!(f, "CollectExec")
+            }
+        }
+    }
+
+    fn statistics(&self) -> Statistics {
+        self.plan.statistics()
     }
 }
 
