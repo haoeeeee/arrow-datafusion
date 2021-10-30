@@ -33,7 +33,7 @@ path = "examples/avro_sql.rs"
 required-features = ["datafusion/avro"]
 
 [dev-dependencies]
-arrow-flight = { git = "https://github.com/DSLAM-UMD/arrow-rs", branch = "squirtle" }
+arrow-flight = { git = "https://github.com/DSLAM-UMD/arrow-rs", branch = "flock" }
 datafusion = { path = "../datafusion" }
 prost = "0.8"
 tonic = "0.5"
