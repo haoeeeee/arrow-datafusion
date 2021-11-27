@@ -59,7 +59,7 @@ Here are some of the projects known to use DataFusion:
 - [InfluxDB IOx](https://github.com/influxdata/influxdb_iox) Time Series Database
 - [ROAPI](https://github.com/roapi/roapi)
 - [Tensorbase](https://github.com/tensorbase/tensorbase)
-- [Squirtle](https://github.com/DSLAM-UMD/Squirtle)
+- [Squirtle](https://github.com/flock-lab/Squirtle)
 
 (if you know of another project, please submit a PR to add a link!)
 

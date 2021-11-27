@@ -48,10 +48,10 @@ force_hash_collisions = []
 avro = ["avro-rs", "num-traits"]
 
 [dependencies]
-ahash = { git = "https://github.com/DSLAM-UMD/aHash", branch = "master" }
+ahash = { git = "https://github.com/flock-lab/aHash", branch = "master" }
 hashbrown = { version = "0.11", features = ["raw"] }
-arrow = { git = "https://github.com/DSLAM-UMD/arrow-rs", branch = "flock", features = ["prettyprint", "simd"] }
-parquet = { git = "https://github.com/DSLAM-UMD/arrow-rs", branch = "flock", features = ["arrow"] }
+arrow = { git = "https://github.com/flock-lab/arrow-rs", branch = "flock", features = ["prettyprint", "simd"] }
+parquet = { git = "https://github.com/flock-lab/arrow-rs", branch = "flock", features = ["arrow"] }
 sqlparser = "0.10"
 serde = {version = "1", features = ["derive"]}
 paste = "^1.0"
