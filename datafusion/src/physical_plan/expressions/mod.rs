@@ -26,6 +26,8 @@ use arrow::compute::kernels::sort::{SortColumn, SortOptions};
 use arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
 
+mod approx_distinct;
+mod array_agg;
 mod average;
 #[macro_use]
 mod binary;
@@ -34,6 +36,8 @@ mod cast;
 mod coercion;
 mod column;
 mod count;
+mod cume_dist;
+mod get_indexed_field;
 mod in_list;
 mod is_not_null;
 mod is_null;
@@ -55,6 +59,9 @@ pub mod helpers {
     pub use super::min_max::{max, min};
 }
 
+pub use approx_distinct::ApproxDistinct;
+pub use array_agg::ArrayAgg;
+pub(crate) use average::is_avg_support_arg_type;
 pub use average::{avg_return_type, Avg, AvgAccumulator};
 pub use binary::{binary, binary_operator_data_type, BinaryExpr};
 pub use case::{case, CaseExpr};
@@ -63,6 +70,8 @@ pub use cast::{
 };
 pub use column::{col, Column};
 pub use count::Count;
+pub use cume_dist::cume_dist;
+pub use get_indexed_field::GetIndexedFieldExpr;
 pub use in_list::{in_list, InListExpr};
 pub use is_not_null::{is_not_null, IsNotNullExpr};
 pub use is_null::{is_null, IsNullExpr};
@@ -74,8 +83,9 @@ pub use negative::{negative, NegativeExpr};
 pub use not::{not, NotExpr};
 pub use nth_value::NthValue;
 pub use nullif::{nullif_func, SUPPORTED_NULLIF_TYPES};
-pub use rank::{dense_rank, rank};
+pub use rank::{dense_rank, percent_rank, rank};
 pub use row_number::RowNumber;
+pub(crate) use sum::is_sum_support_arg_type;
 pub use sum::{sum_return_type, Sum};
 pub use try_cast::{try_cast, TryCastExpr};
 
@@ -113,7 +123,7 @@ impl PhysicalSortExpr {
         let array_to_sort = match value_to_sort {
             ColumnarValue::Array(array) => array,
             ColumnarValue::Scalar(scalar) => {
-                return Err(DataFusionError::Internal(format!(
+                return Err(DataFusionError::Plan(format!(
                     "Sort operation is not applicable to scalar value {}",
                     scalar
                 )));

@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The ending frame boundary can be omitted (if the BETWEEN and AND keywords that surround the
 /// starting frame boundary are also omitted), in which case the ending frame boundary defaults to
 /// CURRENT ROW.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Deserialize, Serialize)]
 pub struct WindowFrame {
     /// A frame type - either ROWS, RANGE or GROUPS
     pub units: WindowFrameUnits,
@@ -212,7 +212,7 @@ impl WindowFrameBound {
 
 /// There are three frame types: ROWS, GROUPS, and RANGE. The frame type determines how the
 /// starting and ending boundaries of the frame are measured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Deserialize, Serialize)]
 pub enum WindowFrameUnits {
     /// The ROWS frame type means that the starting and ending boundaries for the frame are
     /// determined by counting individual rows relative to the current row.

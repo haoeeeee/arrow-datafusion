@@ -22,7 +22,7 @@ use super::{binary_expr, Expr};
 use serde::{Deserialize, Serialize};
 
 /// Operators applied to expressions
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Serialize, Deserialize)]
 pub enum Operator {
     /// Expressions are equal
     Eq,
@@ -54,6 +54,10 @@ pub enum Operator {
     Like,
     /// Does not match a wildcard pattern
     NotLike,
+    /// IS DISTINCT FROM
+    IsDistinctFrom,
+    /// IS NOT DISTINCT FROM
+    IsNotDistinctFrom,
     /// Case sensitive regex match
     RegexMatch,
     /// Case insensitive regex match
@@ -86,6 +90,8 @@ impl fmt::Display for Operator {
             Operator::RegexIMatch => "~*",
             Operator::RegexNotMatch => "!~",
             Operator::RegexNotIMatch => "!~*",
+            Operator::IsDistinctFrom => "IS DISTINCT FROM",
+            Operator::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
         };
         write!(f, "{}", display)
     }
@@ -123,6 +129,14 @@ impl ops::Div for Expr {
     }
 }
 
+impl ops::Rem for Expr {
+    type Output = Self;
+
+    fn rem(self, rhs: Self) -> Self {
+        binary_expr(self, Operator::Modulo, rhs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::prelude::lit;
@@ -131,19 +145,23 @@ mod tests {
     fn test_operators() {
         assert_eq!(
             format!("{:?}", lit(1u32) + lit(2u32)),
-            "UInt32(1) Plus UInt32(2)"
+            "UInt32(1) + UInt32(2)"
         );
         assert_eq!(
             format!("{:?}", lit(1u32) - lit(2u32)),
-            "UInt32(1) Minus UInt32(2)"
+            "UInt32(1) - UInt32(2)"
         );
         assert_eq!(
             format!("{:?}", lit(1u32) * lit(2u32)),
-            "UInt32(1) Multiply UInt32(2)"
+            "UInt32(1) * UInt32(2)"
         );
         assert_eq!(
             format!("{:?}", lit(1u32) / lit(2u32)),
-            "UInt32(1) Divide UInt32(2)"
+            "UInt32(1) / UInt32(2)"
+        );
+        assert_eq!(
+            format!("{:?}", lit(1u32) % lit(2u32)),
+            "UInt32(1) % UInt32(2)"
         );
     }
 }

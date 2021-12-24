@@ -31,7 +31,7 @@ use datafusion::{
 
 use datafusion::execution::context::ExecutionContext;
 use datafusion::logical_plan::{
-    col, Expr, LogicalPlan, LogicalPlanBuilder, UNNAMED_TABLE,
+    col, Expr, LogicalPlan, LogicalPlanBuilder, TableScan, UNNAMED_TABLE,
 };
 use datafusion::physical_plan::{
     ColumnStatistics, ExecutionPlan, Partitioning, RecordBatchStream,
@@ -47,6 +47,7 @@ use std::task::{Context, Poll};
 use serde::{Deserialize, Serialize};
 
 use async_trait::async_trait;
+use datafusion::logical_plan::plan::Projection;
 
 //// Custom source dataframe tests ////
 
@@ -197,6 +198,7 @@ impl ExecutionPlan for CustomExecutionPlan {
     }
 }
 
+#[async_trait]
 impl TableProvider for CustomTableProvider {
     fn as_any(&self) -> &dyn Any {
         self
@@ -206,7 +208,7 @@ impl TableProvider for CustomTableProvider {
         TEST_CUSTOM_SCHEMA_REF!()
     }
 
-    fn scan(
+    async fn scan(
         &self,
         projection: &Option<Vec<usize>>,
         _batch_size: usize,
@@ -230,12 +232,12 @@ async fn custom_source_dataframe() -> Result<()> {
 
     let optimized_plan = ctx.optimize(&logical_plan)?;
     match &optimized_plan {
-        LogicalPlan::Projection { input, .. } => match &**input {
-            LogicalPlan::TableScan {
+        LogicalPlan::Projection(Projection { input, .. }) => match &**input {
+            LogicalPlan::TableScan(TableScan {
                 source,
                 projected_schema,
                 ..
-            } => {
+            }) => {
                 assert_eq!(source.schema().fields().len(), 2);
                 assert_eq!(projected_schema.fields().len(), 1);
             }
@@ -251,7 +253,7 @@ async fn custom_source_dataframe() -> Result<()> {
     );
     assert_eq!(format!("{:?}", optimized_plan), expected);
 
-    let physical_plan = ctx.create_physical_plan(&optimized_plan)?;
+    let physical_plan = ctx.create_physical_plan(&optimized_plan).await?;
 
     assert_eq!(1, physical_plan.schema().fields().len());
     assert_eq!("c2", physical_plan.schema().field(0).name().as_str());
@@ -273,9 +275,13 @@ async fn optimizers_catch_all_statistics() {
 
     let df = ctx
         .sql("SELECT count(*), min(c1), max(c1) from test")
+        .await
         .unwrap();
 
-    let physical_plan = ctx.create_physical_plan(&df.to_logical_plan()).unwrap();
+    let physical_plan = ctx
+        .create_physical_plan(&df.to_logical_plan())
+        .await
+        .unwrap();
 
     // when the optimization kicks in, the source is replaced by an EmptyExec
     assert!(

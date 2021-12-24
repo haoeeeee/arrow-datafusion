@@ -89,7 +89,6 @@ impl PhysicalExpr for NotExpr {
                 )))
             }
             ColumnarValue::Scalar(scalar) => {
-                use std::convert::TryInto;
                 let bool_value: bool = scalar.try_into()?;
                 Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(
                     !bool_value,
