@@ -230,6 +230,7 @@ pub mod variable;
 // re-export dependencies from arrow-rs to minimise version maintenance for crate users
 pub use arrow;
 pub use parquet;
+pub use arrow_flight;
 
 pub(crate) mod field_util;
 
