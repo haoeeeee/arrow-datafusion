@@ -231,6 +231,7 @@ pub mod variable;
 pub use arrow;
 pub use parquet;
 pub use arrow_flight;
+pub use ahash;
 
 pub(crate) mod field_util;
 
