@@ -52,7 +52,7 @@ avro = ["avro-rs", "num-traits"]
 [dependencies]
 ahash = { git = "https://github.com/flock-lab/aHash", branch = "master" }
 hashbrown = { version = "0.11", features = ["raw"] }
-arrow = { git = "https://github.com/flock-lab/arrow-rs", branch = "flock", features = ["prettyprint", "simd"] }
+arrow = { git = "https://github.com/flock-lab/arrow-rs", branch = "flock", features = ["prettyprint"] }
 arrow-flight = { git = "https://github.com/flock-lab/arrow-rs", branch = "flock" }
 parquet = { git = "https://github.com/flock-lab/arrow-rs", branch = "flock", features = ["arrow"] }
 sqlparser = "0.13.0"
